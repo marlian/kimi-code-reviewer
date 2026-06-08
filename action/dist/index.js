@@ -53022,8 +53022,14 @@ async function run() {
         // Get inputs
         const kimiApiKey = core.getInput('kimi_api_key', { required: true });
         const githubToken = core.getInput('github_token');
-        const model = core.getInput('model') || 'kimi-k2.5';
+        const baseUrlInput = core.getInput('base_url').trim();
+        const modelInput = core.getInput('model').trim();
         const failOn = (core.getInput('fail_on') || 'critical');
+        // Resolve endpoint defaults: if base_url points at Kimi Code, default model to kimi-for-coding;
+        // otherwise fall back to Moonshot defaults so v1 behavior is preserved.
+        const baseUrl = baseUrlInput || undefined;
+        const isKimiCode = baseUrlInput.includes('api.kimi.com/coding');
+        const model = modelInput || (isKimiCode ? 'kimi-for-coding' : 'kimi-k2.5');
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
         // Only run on pull requests
@@ -53044,7 +53050,7 @@ async function run() {
         // Override failOn from action input
         config.review.failOn = failOn;
         // Create Kimi client
-        const kimi = new KimiClient({ apiKey: kimiApiKey, model });
+        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
         // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         const result = await orchestrator.reviewPullRequest({

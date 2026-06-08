@@ -1,5 +1,5 @@
 name: 'Kimi Code Reviewer'
-description: 'AI-powered code review using Moonshot Kimi with 256K context window'
+description: 'AI-powered code review using Moonshot Kimi or Kimi Code with 256K context window'
 author: 'howardpen9'
 
 branding:
@@ -8,16 +8,20 @@ branding:
 
 inputs:
   kimi_api_key:
-    description: 'Moonshot AI API key (from platform.moonshot.ai)'
+    description: 'Moonshot AI API key (platform.moonshot.ai) or Kimi Code API key (code.kimi.com)'
     required: true
   github_token:
     description: 'GitHub token for API access'
     required: false
     default: ${{ github.token }}
-  model:
-    description: 'Kimi model to use (kimi-k2.5 for 256K context)'
+  base_url:
+    description: 'API base URL. Default https://api.moonshot.cn/v1 (Moonshot). For Kimi Code use https://api.kimi.com/coding/v1'
     required: false
-    default: 'kimi-k2.5'
+    default: ''
+  model:
+    description: 'Kimi model to use. Default kimi-k2.5 (Moonshot). For Kimi Code use kimi-for-coding'
+    required: false
+    default: ''
   language:
     description: 'Review comment language (en, zh-TW, zh-CN, ja, ko)'
     required: false
