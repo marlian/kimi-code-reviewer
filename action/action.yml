@@ -30,6 +30,10 @@ inputs:
     description: 'Thinking mode: default, enabled, or disabled. Set enabled for Kimi Code k2p6 deep reviews.'
     required: false
     default: 'default'
+  timeout_ms:
+    description: 'Kimi API request timeout in milliseconds. Increase for k2p6 thinking reviews on large PRs.'
+    required: false
+    default: '300000'
   language:
     description: 'Review comment language (en, zh-TW, zh-CN, ja, ko)'
     required: false

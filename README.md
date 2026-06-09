@@ -80,6 +80,7 @@ That's it. Every PR will now get an AI code review.
 | `base_url` | No | `https://api.moonshot.cn/v1` | API endpoint. Set to `https://api.kimi.com/coding/v1` to use Kimi Code |
 | `model` | No | `kimi-k2.5` (or `k2p6` when `base_url` points at Kimi Code) | Model ID. Auto-defaults based on `base_url` |
 | `thinking` | No | `default` | Thinking mode: `default`, `enabled`, or `disabled`. Set `enabled` for Kimi Code `k2p6` deep reviews. |
+| `timeout_ms` | No | `300000` | Kimi API request timeout in milliseconds. Increase for `k2p6` thinking reviews on large PRs. |
 | `language` | No | `en` | Review language: `en`, `zh-TW`, `zh-CN`, `ja`, `ko` |
 | `fail_on` | No | `critical` | Fail the check on: `critical`, `warning`, `never` |
 | `config_path` | No | `.kimi-review.yml` | Path to config file |
@@ -92,6 +93,7 @@ That's it. Every PR will now get an AI code review.
     kimi_api_key: ${{ secrets.KIMICODE_API_KEY }}
     base_url: https://api.kimi.com/coding/v1
     thinking: enabled
+    timeout_ms: 900000
     # model defaults to k2p6 when base_url is api.kimi.com/coding
 ```
 

@@ -34,6 +34,7 @@ export declare class KimiClient {
     private maxTokens;
     private temperature;
     private timeout;
+    private dispatcher;
     private protocol;
     private thinking;
     constructor(config: KimiClientConfig);
