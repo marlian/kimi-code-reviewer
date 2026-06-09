@@ -7,6 +7,11 @@ import { logger } from '../utils/logger.js';
 
 const CONFIG_FILENAME = '.kimi-review.yml';
 
+const INSTRUCTION_PATHS = [
+  '.github/copilot-instructions.md',
+  '.github/instructions/code-review.instructions.md',
+];
+
 export async function loadConfig(
   octokit: Octokit,
   owner: string,
@@ -33,8 +38,33 @@ export async function loadConfig(
       throw new ConfigError(`Invalid config: ${result.error.message}`);
     }
 
-    logger.info({ language: result.data.language, model: result.data.model }, 'Config loaded');
-    return result.data;
+    const config = result.data;
+
+    // Load external instruction files if present
+    const instructionParts: string[] = [];
+    const loadedPaths: string[] = [];
+    for (const path of INSTRUCTION_PATHS) {
+      try {
+        const { data: fileData } = await octokit.repos.getContent({ owner, repo, path });
+        if ('content' in fileData && fileData.encoding === 'base64') {
+          const text = Buffer.from(fileData.content, 'base64').toString('utf-8');
+          if (text.trim()) {
+            instructionParts.push(`--- ${path} ---\n${text}`);
+            loadedPaths.push(path);
+          }
+        }
+      } catch {
+        // ignore missing instruction files
+      }
+    }
+
+    if (instructionParts.length > 0) {
+      config.instructions = instructionParts.join('\n\n');
+      logger.info({ paths: loadedPaths }, 'Loaded external instructions');
+    }
+
+    logger.info({ language: config.language, model: config.model }, 'Config loaded');
+    return config;
   } catch (err) {
     if (err instanceof ConfigError) throw err;
     // 404 — no config file, use defaults

@@ -130,6 +130,7 @@ export declare const reviewConfigSchema: z.ZodObject<{
         systemAppend?: string | undefined;
         reviewFocus?: string | undefined;
     }>>;
+    instructions: z.ZodOptional<z.ZodString>;
     cache: z.ZodDefault<z.ZodObject<{
         enabled: z.ZodDefault<z.ZodBoolean>;
         ttl: z.ZodDefault<z.ZodNumber>;
@@ -183,6 +184,7 @@ export declare const reviewConfigSchema: z.ZodObject<{
         enabled: boolean;
         ttl: number;
     };
+    instructions?: string | undefined;
 }, {
     model?: string | undefined;
     language?: "en" | "zh-TW" | "zh-CN" | "ja" | "ko" | undefined;
@@ -222,6 +224,7 @@ export declare const reviewConfigSchema: z.ZodObject<{
         systemAppend?: string | undefined;
         reviewFocus?: string | undefined;
     } | undefined;
+    instructions?: string | undefined;
     cache?: {
         enabled?: boolean | undefined;
         ttl?: number | undefined;

@@ -24,6 +24,14 @@ function buildSystemPrompt(config: ReviewConfig, customRules: string): string {
     .map(([name]) => name)
     .join(', ');
 
+  const instructionsBlock = config.instructions
+    ? `\n## Repository Instructions\n${config.instructions}\n`
+    : '';
+
+  const reviewFocusBlock = config.prompt.reviewFocus
+    ? `\n## Review Focus\n${config.prompt.reviewFocus}\n`
+    : '';
+
   return `You are an expert code reviewer. Analyze the pull request diff and provide structured feedback.
 
 ## Review Dimensions
@@ -46,7 +54,7 @@ ${REVIEW_JSON_SCHEMA}
 - suggestedFix should be the replacement code snippet, not the full file
 - Keep summary concise (2-5 sentences)
 - Score: 90-100 = excellent, 70-89 = good, 50-69 = needs improvement, <50 = significant issues
-${customRules ? `\n## Additional Rules (from repository config)\n${customRules}` : ''}`;
+${instructionsBlock}${reviewFocusBlock}${customRules ? `\n## Additional Rules (from repository config)\n${customRules}` : ''}${config.prompt.systemAppend ? `\n${config.prompt.systemAppend}` : ''}`;
 }
 
 function buildUserPrompt(ctx: PullRequestContext, fileContents: Map<string, string>): string {

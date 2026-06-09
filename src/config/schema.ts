@@ -70,10 +70,12 @@ export const reviewConfigSchema = z.object({
 
   prompt: z
     .object({
-      systemAppend: z.string().max(2000).optional(),
+      systemAppend: z.string().optional(),
       reviewFocus: z.string().max(500).optional(),
     })
     .default({}),
+
+  instructions: z.string().optional(),
 
   cache: z
     .object({

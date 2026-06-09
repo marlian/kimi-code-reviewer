@@ -45753,6 +45753,12 @@ function buildSystemPrompt(config, customRules) {
         .filter(([, enabled]) => enabled)
         .map(([name]) => name)
         .join(', ');
+    const instructionsBlock = config.instructions
+        ? `\n## Repository Instructions\n${config.instructions}\n`
+        : '';
+    const reviewFocusBlock = config.prompt.reviewFocus
+        ? `\n## Review Focus\n${config.prompt.reviewFocus}\n`
+        : '';
     return `You are an expert code reviewer. Analyze the pull request diff and provide structured feedback.
 
 ## Review Dimensions
@@ -45775,7 +45781,7 @@ ${REVIEW_JSON_SCHEMA}
 - suggestedFix should be the replacement code snippet, not the full file
 - Keep summary concise (2-5 sentences)
 - Score: 90-100 = excellent, 70-89 = good, 50-69 = needs improvement, <50 = significant issues
-${customRules ? `\n## Additional Rules (from repository config)\n${customRules}` : ''}`;
+${instructionsBlock}${reviewFocusBlock}${customRules ? `\n## Additional Rules (from repository config)\n${customRules}` : ''}${config.prompt.systemAppend ? `\n${config.prompt.systemAppend}` : ''}`;
 }
 function buildUserPrompt(ctx, fileContents) {
     const parts = [];
@@ -52909,10 +52915,11 @@ const reviewConfigSchema = objectType({
     }))
         .default([]),
     prompt: objectType({
-        systemAppend: stringType().max(2000).optional(),
+        systemAppend: stringType().optional(),
         reviewFocus: stringType().max(500).optional(),
     })
         .default({}),
+    instructions: stringType().optional(),
     cache: objectType({
         enabled: booleanType().default(true),
         ttl: numberType().default(3600),
@@ -52974,6 +52981,10 @@ const DEFAULT_CONFIG = {
 
 
 const CONFIG_FILENAME = '.kimi-review.yml';
+const INSTRUCTION_PATHS = [
+    '.github/copilot-instructions.md',
+    '.github/instructions/code-review.instructions.md',
+];
 async function loadConfig(octokit, owner, repo) {
     try {
         const { data } = await octokit.repos.getContent({
@@ -52992,8 +53003,31 @@ async function loadConfig(octokit, owner, repo) {
             logger.warn({ errors: result.error.issues }, 'Config validation failed, using defaults');
             throw new ConfigError(`Invalid config: ${result.error.message}`);
         }
-        logger.info({ language: result.data.language, model: result.data.model }, 'Config loaded');
-        return result.data;
+        const config = result.data;
+        // Load external instruction files if present
+        const instructionParts = [];
+        const loadedPaths = [];
+        for (const path of INSTRUCTION_PATHS) {
+            try {
+                const { data: fileData } = await octokit.repos.getContent({ owner, repo, path });
+                if ('content' in fileData && fileData.encoding === 'base64') {
+                    const text = Buffer.from(fileData.content, 'base64').toString('utf-8');
+                    if (text.trim()) {
+                        instructionParts.push(`--- ${path} ---\n${text}`);
+                        loadedPaths.push(path);
+                    }
+                }
+            }
+            catch {
+                // ignore missing instruction files
+            }
+        }
+        if (instructionParts.length > 0) {
+            config.instructions = instructionParts.join('\n\n');
+            logger.info({ paths: loadedPaths }, 'Loaded external instructions');
+        }
+        logger.info({ language: config.language, model: config.model }, 'Config loaded');
+        return config;
     }
     catch (err) {
         if (err instanceof ConfigError)
