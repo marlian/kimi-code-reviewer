@@ -52812,6 +52812,7 @@ class KimiClient {
     maxTokens;
     temperature;
     timeout;
+    protocol;
     constructor(config) {
         this.apiKey = config.apiKey;
         this.model = config.model ?? 'kimi-k2.5';
@@ -52819,8 +52820,15 @@ class KimiClient {
         this.maxTokens = config.maxTokens ?? 16384;
         this.temperature = config.temperature ?? 1;
         this.timeout = config.timeout ?? 300_000;
+        this.protocol = config.protocol ?? 'openai';
     }
     async chatCompletion(params) {
+        if (this.protocol === 'anthropic') {
+            return this.anthropicCompletion(params);
+        }
+        return this.openaiCompletion(params);
+    }
+    async openaiCompletion(params) {
         const body = {
             model: this.model,
             messages: params.messages,
@@ -52852,6 +52860,66 @@ class KimiClient {
                 cachedTokens: data.usage.cached_tokens ?? 0,
             }, 'Kimi API call completed');
             return data;
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    async anthropicCompletion(params) {
+        // Anthropic protocol: /messages endpoint
+        const systemMessage = params.messages.find((m) => m.role === 'system');
+        const otherMessages = params.messages.filter((m) => m.role !== 'system');
+        const body = {
+            model: this.model,
+            max_tokens: this.maxTokens,
+            messages: otherMessages,
+            stream: false,
+        };
+        if (systemMessage) {
+            body.system = systemMessage.content;
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.timeout);
+        try {
+            const res = await fetch(`${this.baseUrl}/messages`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': this.apiKey,
+                    'anthropic-version': '2023-06-01',
+                },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            });
+            if (!res.ok) {
+                const errorBody = await res.text().catch(() => '');
+                throw new KimiApiError(`Kimi API error: ${res.status} ${res.statusText}`, res.status, errorBody);
+            }
+            const data = (await res.json());
+            const text = data.content.map((c) => c.text).join('');
+            const response = {
+                id: 'anthropic',
+                choices: [
+                    {
+                        index: 0,
+                        message: { role: 'assistant', content: text },
+                        finish_reason: 'stop',
+                    },
+                ],
+                usage: {
+                    prompt_tokens: data.usage.input_tokens,
+                    completion_tokens: data.usage.output_tokens,
+                    total_tokens: data.usage.input_tokens + data.usage.output_tokens,
+                    cached_tokens: 0,
+                },
+            };
+            logger.info({
+                model: this.model,
+                promptTokens: response.usage.prompt_tokens,
+                completionTokens: response.usage.completion_tokens,
+                cachedTokens: 0,
+            }, 'Kimi API call completed (Anthropic protocol)');
+            return response;
         }
         finally {
             clearTimeout(timer);
@@ -53058,12 +53126,15 @@ async function run() {
         const githubToken = core.getInput('github_token');
         const baseUrlInput = core.getInput('base_url').trim();
         const modelInput = core.getInput('model').trim();
+        const protocolInput = core.getInput('protocol').trim();
         const failOn = (core.getInput('fail_on') || 'critical');
-        // Resolve endpoint defaults: if base_url points at Kimi Code, default model to kimi-for-coding;
-        // otherwise fall back to Moonshot defaults so v1 behavior is preserved.
+        // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
+        // and default model to k2p6; otherwise fall back to Moonshot OpenAI defaults.
         const baseUrl = baseUrlInput || undefined;
         const isKimiCode = baseUrlInput.includes('api.kimi.com/coding');
-        const model = modelInput || (isKimiCode ? 'kimi-for-coding' : 'kimi-k2.5');
+        const protocol = (protocolInput || (isKimiCode ? 'anthropic' : 'openai'));
+        const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
+        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}`);
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
         // Only run on pull requests
@@ -53084,7 +53155,7 @@ async function run() {
         // Override failOn from action input
         config.review.failOn = failOn;
         // Create Kimi client
-        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
+        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol });
         // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         const result = await orchestrator.reviewPullRequest({

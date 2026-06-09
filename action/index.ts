@@ -12,13 +12,17 @@ async function run(): Promise<void> {
     const githubToken = core.getInput('github_token');
     const baseUrlInput = core.getInput('base_url').trim();
     const modelInput = core.getInput('model').trim();
+    const protocolInput = core.getInput('protocol').trim();
     const failOn = (core.getInput('fail_on') || 'critical') as 'critical' | 'warning' | 'never';
 
-    // Resolve endpoint defaults: if base_url points at Kimi Code, default model to kimi-for-coding;
-    // otherwise fall back to Moonshot defaults so v1 behavior is preserved.
+    // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
+    // and default model to k2p6; otherwise fall back to Moonshot OpenAI defaults.
     const baseUrl = baseUrlInput || undefined;
     const isKimiCode = baseUrlInput.includes('api.kimi.com/coding');
-    const model = modelInput || (isKimiCode ? 'kimi-for-coding' : 'kimi-k2.5');
+    const protocol = (protocolInput || (isKimiCode ? 'anthropic' : 'openai')) as 'openai' | 'anthropic';
+    const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
+
+    core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}`);
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
@@ -46,7 +50,7 @@ async function run(): Promise<void> {
     config.review.failOn = failOn;
 
     // Create Kimi client
-    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl });
+    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol });
 
     // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);

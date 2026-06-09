@@ -6,6 +6,7 @@ export interface KimiClientConfig {
     maxTokens?: number;
     temperature?: number;
     timeout?: number;
+    protocol?: 'openai' | 'anthropic';
 }
 export interface ChatCompletionResponse {
     id: string;
@@ -31,6 +32,7 @@ export declare class KimiClient {
     private maxTokens;
     private temperature;
     private timeout;
+    private protocol;
     constructor(config: KimiClientConfig);
     chatCompletion(params: {
         messages: ChatMessage[];
@@ -38,5 +40,7 @@ export declare class KimiClient {
             type: 'json_object' | 'text';
         };
     }): Promise<ChatCompletionResponse>;
+    private openaiCompletion;
+    private anthropicCompletion;
 }
 //# sourceMappingURL=client.d.ts.map
