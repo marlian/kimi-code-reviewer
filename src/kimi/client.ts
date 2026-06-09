@@ -1,3 +1,4 @@
+import { Agent } from 'undici';
 import type { ChatMessage } from '../types/review.js';
 import { KimiApiError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -37,6 +38,7 @@ export class KimiClient {
   private maxTokens: number;
   private temperature: number;
   private timeout: number;
+  private dispatcher: Agent;
   private protocol: 'openai' | 'anthropic';
   private thinking: KimiThinkingMode;
 
@@ -47,6 +49,10 @@ export class KimiClient {
     this.maxTokens = config.maxTokens ?? 16384;
     this.temperature = config.temperature ?? 1;
     this.timeout = config.timeout ?? 300_000;
+    this.dispatcher = new Agent({
+      headersTimeout: this.timeout,
+      bodyTimeout: this.timeout,
+    });
     this.protocol = config.protocol ?? 'openai';
     this.thinking = config.thinking ?? 'default';
   }
@@ -86,7 +92,8 @@ export class KimiClient {
         },
         body: JSON.stringify(body),
         signal: controller.signal,
-      });
+        dispatcher: this.dispatcher,
+      } as RequestInit & { dispatcher: Agent });
 
       if (!res.ok) {
         const errorBody = await res.text().catch(() => '');
@@ -148,7 +155,8 @@ export class KimiClient {
         },
         body: JSON.stringify(body),
         signal: controller.signal,
-      });
+        dispatcher: this.dispatcher,
+      } as RequestInit & { dispatcher: Agent });
 
       if (!res.ok) {
         const errorBody = await res.text().catch(() => '');
