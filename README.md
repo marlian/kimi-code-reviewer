@@ -78,7 +78,8 @@ That's it. Every PR will now get an AI code review.
 | `kimi_api_key` | Yes | — | Moonshot AI API key or Kimi Code API key |
 | `github_token` | No | `${{ github.token }}` | GitHub token for API access |
 | `base_url` | No | `https://api.moonshot.cn/v1` | API endpoint. Set to `https://api.kimi.com/coding/v1` to use Kimi Code |
-| `model` | No | `kimi-k2.5` (or `kimi-for-coding` when `base_url` points at Kimi Code) | Model ID. Auto-defaults based on `base_url` |
+| `model` | No | `kimi-k2.5` (or `k2p6` when `base_url` points at Kimi Code) | Model ID. Auto-defaults based on `base_url` |
+| `thinking` | No | `default` | Thinking mode: `default`, `enabled`, or `disabled`. Set `enabled` for Kimi Code `k2p6` deep reviews. |
 | `language` | No | `en` | Review language: `en`, `zh-TW`, `zh-CN`, `ja`, `ko` |
 | `fail_on` | No | `critical` | Fail the check on: `critical`, `warning`, `never` |
 | `config_path` | No | `.kimi-review.yml` | Path to config file |
@@ -90,8 +91,11 @@ That's it. Every PR will now get an AI code review.
   with:
     kimi_api_key: ${{ secrets.KIMICODE_API_KEY }}
     base_url: https://api.kimi.com/coding/v1
-    # model defaults to kimi-for-coding when base_url is api.kimi.com/coding
+    thinking: enabled
+    # model defaults to k2p6 when base_url is api.kimi.com/coding
 ```
+
+Kimi Code `k2p6` accepts explicit thinking control on the `/messages` endpoint. For deep PR review, set `thinking: enabled`; relying on endpoint defaults can produce fast non-thinking reviews.
 
 Get the Kimi Code API key at **[code.kimi.com](https://code.kimi.com)** → Settings → API Keys. Kimi Code API keys and Moonshot API keys are **not interchangeable**.
 

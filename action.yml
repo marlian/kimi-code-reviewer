@@ -19,9 +19,17 @@ inputs:
     required: false
     default: ''
   model:
-    description: 'Kimi model to use. Default kimi-k2.5 (Moonshot). For Kimi Code use kimi-for-coding'
+    description: 'Kimi model to use. Default kimi-k2.5 (Moonshot). For Kimi Code use k2p6'
     required: false
     default: ''
+  protocol:
+    description: 'API protocol: openai or anthropic. Auto-detected from base_url when omitted.'
+    required: false
+    default: ''
+  thinking:
+    description: 'Thinking mode: default, enabled, or disabled. Set enabled for Kimi Code k2p6 deep reviews.'
+    required: false
+    default: 'default'
   language:
     description: 'Review comment language (en, zh-TW, zh-CN, ja, ko)'
     required: false

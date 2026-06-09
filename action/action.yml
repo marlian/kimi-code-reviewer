@@ -26,6 +26,10 @@ inputs:
     description: 'Kimi model to use (k2p6 for Kimi Code, kimi-k2.5 for Moonshot)'
     required: false
     default: 'kimi-k2.5'
+  thinking:
+    description: 'Thinking mode: default, enabled, or disabled. Set enabled for Kimi Code k2p6 deep reviews.'
+    required: false
+    default: 'default'
   language:
     description: 'Review comment language (en, zh-TW, zh-CN, ja, ko)'
     required: false

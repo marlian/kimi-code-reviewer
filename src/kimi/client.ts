@@ -10,7 +10,10 @@ export interface KimiClientConfig {
   temperature?: number;
   timeout?: number;
   protocol?: 'openai' | 'anthropic';
+  thinking?: KimiThinkingMode;
 }
+
+export type KimiThinkingMode = 'default' | 'enabled' | 'disabled';
 
 export interface ChatCompletionResponse {
   id: string;
@@ -35,6 +38,7 @@ export class KimiClient {
   private temperature: number;
   private timeout: number;
   private protocol: 'openai' | 'anthropic';
+  private thinking: KimiThinkingMode;
 
   constructor(config: KimiClientConfig) {
     this.apiKey = config.apiKey;
@@ -44,6 +48,7 @@ export class KimiClient {
     this.temperature = config.temperature ?? 1;
     this.timeout = config.timeout ?? 300_000;
     this.protocol = config.protocol ?? 'openai';
+    this.thinking = config.thinking ?? 'default';
   }
 
   async chatCompletion(params: {
@@ -66,6 +71,7 @@ export class KimiClient {
       max_tokens: this.maxTokens,
       temperature: this.temperature,
       ...(params.responseFormat && { response_format: params.responseFormat }),
+      ...this.thinkingBody(),
     };
 
     const controller = new AbortController();
@@ -122,6 +128,7 @@ export class KimiClient {
       max_tokens: this.maxTokens,
       messages: otherMessages,
       stream: false,
+      ...this.thinkingBody(),
     };
 
     if (systemMessage) {
@@ -190,5 +197,12 @@ export class KimiClient {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  private thinkingBody(): Record<string, unknown> {
+    if (this.thinking === 'default') {
+      return {};
+    }
+    return { thinking: { type: this.thinking } };
   }
 }
