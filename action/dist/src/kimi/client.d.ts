@@ -7,7 +7,9 @@ export interface KimiClientConfig {
     temperature?: number;
     timeout?: number;
     protocol?: 'openai' | 'anthropic';
+    thinking?: KimiThinkingMode;
 }
+export type KimiThinkingMode = 'default' | 'enabled' | 'disabled';
 export interface ChatCompletionResponse {
     id: string;
     choices: Array<{
@@ -33,6 +35,7 @@ export declare class KimiClient {
     private temperature;
     private timeout;
     private protocol;
+    private thinking;
     constructor(config: KimiClientConfig);
     chatCompletion(params: {
         messages: ChatMessage[];
@@ -42,5 +45,6 @@ export declare class KimiClient {
     }): Promise<ChatCompletionResponse>;
     private openaiCompletion;
     private anthropicCompletion;
+    private thinkingBody;
 }
 //# sourceMappingURL=client.d.ts.map

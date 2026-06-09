@@ -1,9 +1,20 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import { ReviewOrchestrator } from '../src/review/orchestrator.js';
-import { KimiClient } from '../src/kimi/client.js';
+import { KimiClient, type KimiThinkingMode } from '../src/kimi/client.js';
 import { loadConfig } from '../src/config/loader.js';
 import { calculateCost } from '../src/utils/tokens.js';
+
+function parseThinkingMode(raw: string): KimiThinkingMode {
+  const value = raw.trim().toLowerCase();
+  if (value === '' || value === 'default') {
+    return 'default';
+  }
+  if (value === 'enabled' || value === 'disabled') {
+    return value;
+  }
+  throw new Error('thinking must be one of: default, enabled, disabled');
+}
 
 async function run(): Promise<void> {
   try {
@@ -13,6 +24,7 @@ async function run(): Promise<void> {
     const baseUrlInput = core.getInput('base_url').trim();
     const modelInput = core.getInput('model').trim();
     const protocolInput = core.getInput('protocol').trim();
+    const thinking = parseThinkingMode(core.getInput('thinking').trim());
     const failOn = (core.getInput('fail_on') || 'critical') as 'critical' | 'warning' | 'never';
 
     // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
@@ -22,7 +34,9 @@ async function run(): Promise<void> {
     const protocol = (protocolInput || (isKimiCode ? 'anthropic' : 'openai')) as 'openai' | 'anthropic';
     const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
 
-    core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}`);
+    core.info(
+      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}`,
+    );
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
@@ -50,7 +64,7 @@ async function run(): Promise<void> {
     config.review.failOn = failOn;
 
     // Create Kimi client
-    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol });
+    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking });
 
     // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);
