@@ -16,6 +16,21 @@ function parseThinkingMode(raw: string): KimiThinkingMode {
   throw new Error('thinking must be one of: default, enabled, disabled');
 }
 
+function parsePositiveIntegerInput(raw: string, name: string): number | undefined {
+  const value = raw.trim();
+  if (value === '') {
+    return undefined;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
+}
+
 async function run(): Promise<void> {
   try {
     // Get inputs
@@ -25,6 +40,7 @@ async function run(): Promise<void> {
     const modelInput = core.getInput('model').trim();
     const protocolInput = core.getInput('protocol').trim();
     const thinking = parseThinkingMode(core.getInput('thinking').trim());
+    const timeout = parsePositiveIntegerInput(core.getInput('timeout_ms').trim(), 'timeout_ms');
     const failOn = (core.getInput('fail_on') || 'critical') as 'critical' | 'warning' | 'never';
 
     // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
@@ -35,7 +51,7 @@ async function run(): Promise<void> {
     const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
 
     core.info(
-      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}`,
+      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, timeoutMs: ${timeout ?? 'default'}`,
     );
 
     const octokit = github.getOctokit(githubToken);
@@ -64,7 +80,7 @@ async function run(): Promise<void> {
     config.review.failOn = failOn;
 
     // Create Kimi client
-    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking });
+    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, timeout });
 
     // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);

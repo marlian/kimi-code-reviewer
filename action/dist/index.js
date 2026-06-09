@@ -53139,6 +53139,20 @@ function parseThinkingMode(raw) {
     }
     throw new Error('thinking must be one of: default, enabled, disabled');
 }
+function parsePositiveIntegerInput(raw, name) {
+    const value = raw.trim();
+    if (value === '') {
+        return undefined;
+    }
+    if (!/^\d+$/.test(value)) {
+        throw new Error(`${name} must be a positive integer`);
+    }
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        throw new Error(`${name} must be a positive integer`);
+    }
+    return parsed;
+}
 async function run() {
     try {
         // Get inputs
@@ -53148,6 +53162,7 @@ async function run() {
         const modelInput = core.getInput('model').trim();
         const protocolInput = core.getInput('protocol').trim();
         const thinking = parseThinkingMode(core.getInput('thinking').trim());
+        const timeout = parsePositiveIntegerInput(core.getInput('timeout_ms').trim(), 'timeout_ms');
         const failOn = (core.getInput('fail_on') || 'critical');
         // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
         // and default model to k2p6; otherwise fall back to Moonshot OpenAI defaults.
@@ -53155,7 +53170,7 @@ async function run() {
         const isKimiCode = baseUrlInput.includes('api.kimi.com/coding');
         const protocol = (protocolInput || (isKimiCode ? 'anthropic' : 'openai'));
         const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
-        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}`);
+        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, timeoutMs: ${timeout ?? 'default'}`);
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
         // Only run on pull requests
@@ -53176,7 +53191,7 @@ async function run() {
         // Override failOn from action input
         config.review.failOn = failOn;
         // Create Kimi client
-        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking });
+        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, timeout });
         // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         const result = await orchestrator.reviewPullRequest({
