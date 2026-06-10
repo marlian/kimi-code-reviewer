@@ -35,6 +35,14 @@ export const reviewConfigSchema = z.object({
       maxAnnotations: z.number().min(1).max(100).default(30),
 
       failOn: z.enum(['critical', 'warning', 'never']).default('critical'),
+
+      // Per-call input budget (tokens). Kimi's window is 256K; the default
+      // leaves headroom for thinking mode and output.
+      contextTokens: z.number().int().min(10_000).max(240_000).default(200_000),
+
+      // Target diff tokens per batch when the review is chunked across
+      // multiple API calls.
+      chunkTokens: z.number().int().min(5_000).max(200_000).default(60_000),
     })
     .default({}),
 

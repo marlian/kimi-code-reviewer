@@ -50,6 +50,8 @@ export declare const reviewConfigSchema: z.ZodObject<{
         minSeverity: z.ZodDefault<z.ZodEnum<["critical", "warning", "suggestion", "nitpick"]>>;
         maxAnnotations: z.ZodDefault<z.ZodNumber>;
         failOn: z.ZodDefault<z.ZodEnum<["critical", "warning", "never"]>>;
+        contextTokens: z.ZodDefault<z.ZodNumber>;
+        chunkTokens: z.ZodDefault<z.ZodNumber>;
     }, "strip", z.ZodTypeAny, {
         auto: {
             enabled: boolean;
@@ -70,6 +72,8 @@ export declare const reviewConfigSchema: z.ZodObject<{
         minSeverity: "critical" | "warning" | "suggestion" | "nitpick";
         maxAnnotations: number;
         failOn: "critical" | "warning" | "never";
+        contextTokens: number;
+        chunkTokens: number;
     }, {
         auto?: {
             enabled?: boolean | undefined;
@@ -90,6 +94,8 @@ export declare const reviewConfigSchema: z.ZodObject<{
         minSeverity?: "critical" | "warning" | "suggestion" | "nitpick" | undefined;
         maxAnnotations?: number | undefined;
         failOn?: "critical" | "warning" | "never" | undefined;
+        contextTokens?: number | undefined;
+        chunkTokens?: number | undefined;
     }>>;
     files: z.ZodDefault<z.ZodObject<{
         include: z.ZodDefault<z.ZodArray<z.ZodString, "many">>;
@@ -164,6 +170,8 @@ export declare const reviewConfigSchema: z.ZodObject<{
         minSeverity: "critical" | "warning" | "suggestion" | "nitpick";
         maxAnnotations: number;
         failOn: "critical" | "warning" | "never";
+        contextTokens: number;
+        chunkTokens: number;
     };
     files: {
         include: string[];
@@ -208,6 +216,8 @@ export declare const reviewConfigSchema: z.ZodObject<{
         minSeverity?: "critical" | "warning" | "suggestion" | "nitpick" | undefined;
         maxAnnotations?: number | undefined;
         failOn?: "critical" | "warning" | "never" | undefined;
+        contextTokens?: number | undefined;
+        chunkTokens?: number | undefined;
     } | undefined;
     files?: {
         include?: string[] | undefined;

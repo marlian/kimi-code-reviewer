@@ -51963,7 +51963,7 @@ if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') 
 
   function sleep (ms) {
     // also filters out NaN, non-number types, including empty strings, but allows bigints
-    const valid = ms > 0 && ms < Infinity
+    const valid = ms > 0 && ms < Infinity 
     if (valid === false) {
       if (typeof ms !== 'number' && typeof ms !== 'bigint') {
         throw TypeError('sleep: ms must be a number')
@@ -51978,7 +51978,7 @@ if (typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined') 
 
   function sleep (ms) {
     // also filters out NaN, non-number types, including empty strings, but allows bigints
-    const valid = ms > 0 && ms < Infinity
+    const valid = ms > 0 && ms < Infinity 
     if (valid === false) {
       if (typeof ms !== 'number' && typeof ms !== 'bigint') {
         throw TypeError('sleep: ms must be a number')
@@ -95122,119 +95122,141 @@ const logger = pino_default()({
 ;// CONCATENATED MODULE: ./src/kimi/context-packer.ts
 
 
-const MAX_CONTEXT_TOKENS = 256_000;
-const SYSTEM_PROMPT_RESERVE = 4_000;
-const OUTPUT_RESERVE = 16_384;
-const BUDGET = MAX_CONTEXT_TOKENS - SYSTEM_PROMPT_RESERVE - OUTPUT_RESERVE; // ~235K
-const FULL_MODE_THRESHOLD = 50_000;
-const MIXED_MODE_THRESHOLD = 150_000;
-function packContext(ctx, config) {
+/**
+ * Fraction of the per-call budget that the diff + file contents may occupy.
+ * The remainder is headroom for system prompt drift, message framing, and
+ * tokenizer estimation error.
+ */
+const PACK_FILL_RATIO = 0.9;
+/**
+ * In mixed mode the diff must leave room for at least some file contents,
+ * otherwise mixed mode degenerates into diff-only and chunking is better.
+ */
+const MIXED_DIFF_RATIO = 0.6;
+/**
+ * In chunked mode, cap how much of the per-call budget file contents may
+ * occupy on top of the batch diff.
+ */
+const CHUNK_CONTENT_RATIO = 0.6;
+/** Per-file framing overhead (markdown headers, fences) in tokens. */
+const FILE_OVERHEAD_TOKENS = 24;
+function fileCosts(ctx) {
+    return ctx.changedFiles.map((file) => {
+        const content = ctx.fileContents.get(file.filename);
+        return {
+            file,
+            patchTokens: file.patch ? estimateTokens(file.patch) + FILE_OVERHEAD_TOKENS : 0,
+            contentTokens: content ? estimateTokens(content) + FILE_OVERHEAD_TOKENS : 0,
+        };
+    });
+}
+/**
+ * Plan how the PR context will be sent to Kimi.
+ *
+ * - full: whole diff + all file contents fit in one call
+ * - mixed: whole diff in one call, file contents included by priority until budget
+ * - chunked: diff is too large for one call — split changed files into batches,
+ *   one API call per batch (map), results merged afterwards (reduce)
+ */
+function planContext(ctx, config) {
+    const contextTokens = config.review.contextTokens;
+    const chunkTokens = Math.min(config.review.chunkTokens, contextTokens);
+    const packBudget = Math.floor(contextTokens * PACK_FILL_RATIO);
     const diffTokens = estimateTokens(ctx.diff);
-    logger.info({ diffTokens, filesCount: ctx.changedFiles.length }, 'Packing context');
-    if (diffTokens < FULL_MODE_THRESHOLD) {
-        return packFull(ctx, config);
+    const costs = fileCosts(ctx);
+    const totalContentTokens = costs.reduce((sum, c) => sum + c.contentTokens, 0);
+    logger.info({ diffTokens, totalContentTokens, filesCount: ctx.changedFiles.length, contextTokens, chunkTokens }, 'Planning context');
+    // Full mode: everything fits.
+    if (diffTokens + totalContentTokens <= packBudget) {
+        return {
+            strategy: 'full',
+            includedFiles: costs.filter((c) => c.contentTokens > 0).map((c) => c.file.filename),
+            truncatedFiles: [],
+            unreviewableFiles: [],
+            batches: [],
+            diffTokens,
+            contextTokens,
+        };
     }
-    if (diffTokens < MIXED_MODE_THRESHOLD) {
-        return packMixed(ctx, config);
-    }
-    return packChunked(ctx, config);
-}
-/** Full mode: include all file contents + diff */
-function packFull(ctx, _config) {
-    const includedFiles = [];
-    const messages = [];
-    let totalTokens = 0;
-    // Add file contents
-    for (const file of ctx.changedFiles) {
-        const content = ctx.fileContents.get(file.filename);
-        if (content) {
-            const tokens = estimateTokens(content);
-            if (totalTokens + tokens < BUDGET * 0.6) {
-                includedFiles.push(file.filename);
-                totalTokens += tokens;
-            }
-        }
-    }
-    // Build the user message with file contents + diff
-    const parts = [];
-    parts.push(`## Pull Request: ${ctx.title}\n`);
-    if (ctx.body)
-        parts.push(`### Description\n${ctx.body}\n`);
-    if (includedFiles.length > 0) {
-        parts.push('### File Contents (full context)\n');
-        for (const path of includedFiles) {
-            const content = ctx.fileContents.get(path);
-            parts.push(`#### ${path}\n\`\`\`\n${content}\n\`\`\`\n`);
-        }
-    }
-    parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
-    messages.push({ role: 'user', content: parts.join('\n') });
-    totalTokens += estimateTokens(ctx.diff);
-    return {
-        messages,
-        totalTokens,
-        includedFiles,
-        truncatedFiles: [],
-        strategy: 'full',
-    };
-}
-/** Mixed mode: critical files get full content, rest get diff only */
-function packMixed(ctx, _config) {
-    const includedFiles = [];
-    const truncatedFiles = [];
-    let totalTokens = 0;
-    // Prioritize files by change size (more changes = more important for context)
-    const sorted = [...ctx.changedFiles].sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions));
-    for (const file of sorted) {
-        const content = ctx.fileContents.get(file.filename);
-        if (content) {
-            const tokens = estimateTokens(content);
-            if (totalTokens + tokens < BUDGET * 0.4) {
-                includedFiles.push(file.filename);
-                totalTokens += tokens;
+    // Mixed mode: full diff still fits with room for prioritized contents.
+    if (diffTokens <= Math.floor(contextTokens * MIXED_DIFF_RATIO)) {
+        const includedFiles = [];
+        const truncatedFiles = [];
+        let used = diffTokens;
+        // Prioritize files by change size (more changes = more important for context)
+        const sorted = [...costs].sort((a, b) => (b.file.additions + b.file.deletions) - (a.file.additions + a.file.deletions));
+        for (const cost of sorted) {
+            if (cost.contentTokens === 0)
+                continue;
+            if (used + cost.contentTokens <= packBudget) {
+                includedFiles.push(cost.file.filename);
+                used += cost.contentTokens;
             }
             else {
-                truncatedFiles.push(file.filename);
+                truncatedFiles.push(cost.file.filename);
+            }
+        }
+        return {
+            strategy: 'mixed',
+            includedFiles,
+            truncatedFiles,
+            unreviewableFiles: [],
+            batches: [],
+            diffTokens,
+            contextTokens,
+        };
+    }
+    // Chunked mode: split files into batches of per-file patches.
+    const batches = [];
+    const unreviewableFiles = [];
+    let current = null;
+    for (const cost of costs) {
+        if (!cost.file.patch) {
+            // Binary or too-large-for-API files have no patch; they cannot be
+            // reviewed inline and are reported in the summary instead.
+            unreviewableFiles.push(cost.file.filename);
+            continue;
+        }
+        if (current && current.diffTokens + cost.patchTokens > chunkTokens) {
+            batches.push(current);
+            current = null;
+        }
+        if (!current) {
+            current = { files: [], diffTokens: 0, contentFiles: [] };
+        }
+        current.files.push(cost.file);
+        current.diffTokens += cost.patchTokens;
+    }
+    if (current && current.files.length > 0) {
+        batches.push(current);
+    }
+    // Per batch, attach file contents while the call stays within budget.
+    const contentBudget = Math.floor(contextTokens * CHUNK_CONTENT_RATIO);
+    for (const batch of batches) {
+        let used = batch.diffTokens;
+        const sorted = [...batch.files].sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions));
+        for (const file of sorted) {
+            const cost = costs.find((c) => c.file.filename === file.filename);
+            if (!cost || cost.contentTokens === 0)
+                continue;
+            if (used + cost.contentTokens <= contentBudget) {
+                batch.contentFiles.push(file.filename);
+                used += cost.contentTokens;
             }
         }
     }
-    const parts = [];
-    parts.push(`## Pull Request: ${ctx.title}\n`);
-    if (ctx.body)
-        parts.push(`### Description\n${ctx.body}\n`);
-    if (includedFiles.length > 0) {
-        parts.push('### Key File Contents\n');
-        for (const path of includedFiles) {
-            const content = ctx.fileContents.get(path);
-            parts.push(`#### ${path}\n\`\`\`\n${content}\n\`\`\`\n`);
-        }
-    }
-    parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
-    totalTokens += estimateTokens(ctx.diff);
+    const includedFiles = batches.flatMap((b) => b.contentFiles);
+    const truncatedFiles = costs
+        .filter((c) => c.contentTokens > 0 && !includedFiles.includes(c.file.filename))
+        .map((c) => c.file.filename);
     return {
-        messages: [{ role: 'user', content: parts.join('\n') }],
-        totalTokens,
+        strategy: 'chunked',
         includedFiles,
         truncatedFiles,
-        strategy: 'mixed',
-    };
-}
-/** Chunked mode: split by files into multiple reviews */
-function packChunked(ctx, _config) {
-    // For chunked mode, just send the diff without file contents
-    // The orchestrator will handle splitting into multiple API calls
-    const parts = [];
-    parts.push(`## Pull Request: ${ctx.title}\n`);
-    if (ctx.body)
-        parts.push(`### Description\n${ctx.body}\n`);
-    parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
-    const totalTokens = estimateTokens(ctx.diff);
-    return {
-        messages: [{ role: 'user', content: parts.join('\n') }],
-        totalTokens,
-        includedFiles: [],
-        truncatedFiles: ctx.changedFiles.map((f) => f.filename),
-        strategy: 'chunked',
+        unreviewableFiles,
+        batches,
+        diffTokens,
+        contextTokens,
     };
 }
 
@@ -95306,12 +95328,15 @@ function buildUserPrompt(ctx, fileContents) {
     parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
     return parts.join('\n');
 }
-function buildReviewMessages(ctx, config) {
+function buildReviewSystemPrompt(config) {
     const customRules = config.rules
         .map((r) => `- [${r.severity}] ${r.name}: ${r.description}`)
         .join('\n');
+    return buildSystemPrompt(config, customRules);
+}
+function buildReviewMessages(ctx, config) {
     return [
-        { role: 'system', content: buildSystemPrompt(config, customRules) },
+        { role: 'system', content: buildReviewSystemPrompt(config) },
         { role: 'user', content: buildUserPrompt(ctx, ctx.fileContents) },
     ];
 }
@@ -95333,7 +95358,12 @@ function buildReviewMessages(ctx, config) {
  * 4. PR description (occasionally edited)
  * 5. Diff content (changes every push — always last)
  */
-function buildCacheOptimizedMessages(systemPrompt, ctx, config, fileContents) {
+/**
+ * Layers 1+2: system prompt + repo config acknowledgment. Identical across
+ * every call for the same repo — including all batches of a chunked review —
+ * which maximizes Kimi prefix cache hits.
+ */
+function buildStablePrefix(systemPrompt, config) {
     const messages = [];
     // Layer 1: System prompt (most stable)
     messages.push({ role: 'system', content: systemPrompt });
@@ -95343,6 +95373,10 @@ function buildCacheOptimizedMessages(systemPrompt, ctx, config, fileContents) {
         messages.push({ role: 'user', content: `Repository review configuration:\n${configSummary}` });
         messages.push({ role: 'assistant', content: 'Understood. I will follow the repository configuration.' });
     }
+    return messages;
+}
+function buildCacheOptimizedMessages(systemPrompt, ctx, config, fileContents) {
+    const messages = buildStablePrefix(systemPrompt, config);
     // Layer 3: Base file contents (stable across pushes to same PR)
     if (fileContents.size > 0) {
         const fileParts = ['Here are the relevant source files for context:'];
@@ -95367,6 +95401,46 @@ function buildCacheOptimizedMessages(systemPrompt, ctx, config, fileContents) {
     messages.push({ role: 'user', content: reviewRequest.join('\n') });
     return messages;
 }
+/**
+ * Build messages for one batch of a chunked review. Shares the stable prefix
+ * with every other batch (prefix cache), then includes only this batch's
+ * file contents and per-file patches.
+ */
+function buildChunkedMessages(systemPrompt, ctx, config, batch, batchIndex, batchCount, fileContents) {
+    const messages = buildStablePrefix(systemPrompt, config);
+    // Layer 3: contents of this batch's files (when budget allows)
+    if (batch.contentFiles.length > 0) {
+        const fileParts = ['Here are the relevant source files for context:'];
+        for (const path of batch.contentFiles) {
+            const content = fileContents.get(path);
+            if (!content)
+                continue;
+            fileParts.push(`\n### ${path}\n\`\`\`\n${content}\n\`\`\``);
+        }
+        messages.push({ role: 'user', content: fileParts.join('\n') });
+        messages.push({ role: 'assistant', content: 'Files loaded. Send me the pull request diff to review.' });
+    }
+    // Layer 4+5: PR metadata + this batch's per-file diffs
+    const reviewRequest = [];
+    reviewRequest.push(`## Pull Request #${ctx.pullNumber}: ${ctx.title}`);
+    if (ctx.body) {
+        reviewRequest.push(`\n### Description\n${ctx.body}`);
+    }
+    reviewRequest.push(`\nThis pull request is too large for a single review pass, so it is split into ${batchCount} parts. ` +
+        `This is part ${batchIndex + 1} of ${batchCount}. Other parts are reviewed separately — ` +
+        `only annotate the files listed below, and do not penalize the score for files you cannot see.`);
+    reviewRequest.push(`\n### Changed Files in this part (${batch.files.length} files)`);
+    for (const file of batch.files) {
+        reviewRequest.push(`- ${file.filename} (+${file.additions}/-${file.deletions})`);
+    }
+    reviewRequest.push('\n### Diff');
+    for (const file of batch.files) {
+        reviewRequest.push(`\n#### ${file.filename}\n\`\`\`diff\n${file.patch ?? ''}\n\`\`\``);
+    }
+    reviewRequest.push('\nPlease review and respond with JSON.');
+    messages.push({ role: 'user', content: reviewRequest.join('\n') });
+    return messages;
+}
 function buildConfigSummary(config) {
     const parts = [];
     parts.push(`Language: ${config.language}`);
@@ -95386,6 +95460,60 @@ function buildConfigSummary(config) {
         parts.push(`\nReview focus: ${config.prompt.reviewFocus}`);
     }
     return parts.join('\n');
+}
+
+;// CONCATENATED MODULE: ./src/review/merge.ts
+/**
+ * Merge the per-batch results of a chunked review into a single ReviewResult.
+ *
+ * - annotations: concatenated, deduplicated by (path, startLine, title)
+ * - stats: recomputed from the merged annotations
+ * - tokensUsed: summed across batches
+ * - score: minimum across batches (a PR is as healthy as its worst part)
+ * - summary: per-part summaries joined under a chunked-review header
+ */
+function mergeReviewResults(parts) {
+    if (parts.length === 0) {
+        throw new Error('mergeReviewResults requires at least one result');
+    }
+    if (parts.length === 1) {
+        return parts[0];
+    }
+    const seen = new Set();
+    const annotations = [];
+    for (const part of parts) {
+        for (const annotation of part.annotations) {
+            const key = `${annotation.path}:${annotation.startLine}:${annotation.title.trim().toLowerCase()}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            annotations.push(annotation);
+        }
+    }
+    const stats = { critical: 0, warning: 0, suggestion: 0, nitpick: 0 };
+    for (const annotation of annotations) {
+        stats[annotation.severity]++;
+    }
+    const tokensUsed = parts.reduce((acc, part) => ({
+        input: acc.input + part.tokensUsed.input,
+        output: acc.output + part.tokensUsed.output,
+        cached: acc.cached + part.tokensUsed.cached,
+    }), { input: 0, output: 0, cached: 0 });
+    const score = Math.min(...parts.map((part) => part.score));
+    const summaryParts = [
+        `Large PR reviewed in ${parts.length} parts (chunked mode).`,
+        '',
+    ];
+    parts.forEach((part, index) => {
+        summaryParts.push(`**Part ${index + 1}/${parts.length}:** ${part.summary}`);
+    });
+    return {
+        summary: summaryParts.join('\n'),
+        score,
+        annotations,
+        stats,
+        tokensUsed,
+    };
 }
 
 ;// CONCATENATED MODULE: ./node_modules/zod/v3/helpers/util.js
@@ -102192,6 +102320,7 @@ class ReviewError extends Error {
 
 
 
+
 class ReviewOrchestrator {
     octokit;
     kimi;
@@ -102234,24 +102363,81 @@ class ReviewOrchestrator {
                 });
                 return result;
             }
-            // Step 4: Pack context (256K optimization)
-            const packed = packContext(prContext, this.config);
-            logger.info({ strategy: packed.strategy, totalTokens: packed.totalTokens }, 'Context packed');
-            // Step 5: Build messages (cache-optimized order)
-            const systemPrompt = buildReviewMessages(prContext, this.config)[0].content;
-            const messages = buildCacheOptimizedMessages(systemPrompt, prContext, this.config, prContext.fileContents);
-            // Step 6: Call Kimi API
-            logger.info({ messageCount: messages.length }, 'Calling Kimi API');
-            const response = await this.kimi.chatCompletion({
-                messages,
-                responseFormat: { type: 'json_object' },
-            });
-            // Step 7: Parse response
-            const result = parseKimiResponse(response.choices[0].message.content, {
-                input: response.usage.prompt_tokens,
-                output: response.usage.completion_tokens,
-                cached: response.usage.cached_tokens ?? 0,
-            });
+            // Step 3.5: Drop contents of files excluded by the filter so they
+            // never reach the model context.
+            const allowedFiles = new Set(filteredFiles.map((f) => f.filename));
+            for (const name of [...prContext.fileContents.keys()]) {
+                if (!allowedFiles.has(name)) {
+                    prContext.fileContents.delete(name);
+                }
+            }
+            // Step 4: Plan context packing (budget-aware)
+            const plan = planContext(prContext, this.config);
+            logger.info({
+                strategy: plan.strategy,
+                diffTokens: plan.diffTokens,
+                includedFiles: plan.includedFiles.length,
+                truncatedFiles: plan.truncatedFiles.length,
+                batches: plan.batches.length,
+            }, 'Context planned');
+            const systemPrompt = buildReviewSystemPrompt(this.config);
+            let result;
+            if (plan.strategy === 'chunked' && plan.batches.length === 0) {
+                // Every changed file lacks a text patch (binary or oversized diffs):
+                // nothing is reviewable inline — return a clean result instead of
+                // calling the API with empty batches.
+                result = {
+                    summary: 'No reviewable diff content: none of the changed files has a text patch (binary or oversized file diffs).',
+                    score: 100,
+                    annotations: [],
+                    stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
+                    tokensUsed: { input: 0, output: 0, cached: 0 },
+                };
+            }
+            else if (plan.strategy === 'chunked') {
+                // Step 5-7 (chunked): one call per batch, then merge (map-reduce).
+                const parts = [];
+                for (const [index, batch] of plan.batches.entries()) {
+                    const messages = buildChunkedMessages(systemPrompt, prContext, this.config, batch, index, plan.batches.length, prContext.fileContents);
+                    logger.info({ batch: index + 1, batches: plan.batches.length, files: batch.files.length, diffTokens: batch.diffTokens }, 'Calling Kimi API (chunked)');
+                    const response = await this.kimi.chatCompletion({
+                        messages,
+                        responseFormat: { type: 'json_object' },
+                    });
+                    parts.push(parseKimiResponse(response.choices[0].message.content, {
+                        input: response.usage.prompt_tokens,
+                        output: response.usage.completion_tokens,
+                        cached: response.usage.cached_tokens ?? 0,
+                    }));
+                }
+                result = mergeReviewResults(parts);
+            }
+            else {
+                // Step 5 (single call): only the planned file contents enter context.
+                const includedContents = new Map();
+                for (const name of plan.includedFiles) {
+                    const content = prContext.fileContents.get(name);
+                    if (content)
+                        includedContents.set(name, content);
+                }
+                const messages = buildCacheOptimizedMessages(systemPrompt, prContext, this.config, includedContents);
+                // Step 6: Call Kimi API
+                logger.info({ messageCount: messages.length }, 'Calling Kimi API');
+                const response = await this.kimi.chatCompletion({
+                    messages,
+                    responseFormat: { type: 'json_object' },
+                });
+                // Step 7: Parse response
+                result = parseKimiResponse(response.choices[0].message.content, {
+                    input: response.usage.prompt_tokens,
+                    output: response.usage.completion_tokens,
+                    cached: response.usage.cached_tokens ?? 0,
+                });
+            }
+            // Step 7.5: Surface files that could not be reviewed inline.
+            if (plan.unreviewableFiles.length > 0) {
+                result.summary += `\n\n**Not reviewed inline** (no patch available — binary or too large): ${plan.unreviewableFiles.join(', ')}`;
+            }
             // Step 8: Filter by severity
             const minSeverityOrder = ['critical', 'warning', 'suggestion', 'nitpick'];
             const minIdx = minSeverityOrder.indexOf(this.config.review.minSeverity);
@@ -102484,6 +102670,12 @@ const reviewConfigSchema = objectType({
             .default('suggestion'),
         maxAnnotations: numberType().min(1).max(100).default(30),
         failOn: enumType(['critical', 'warning', 'never']).default('critical'),
+        // Per-call input budget (tokens). Kimi's window is 256K; the default
+        // leaves headroom for thinking mode and output.
+        contextTokens: numberType().int().min(10_000).max(240_000).default(200_000),
+        // Target diff tokens per batch when the review is chunked across
+        // multiple API calls.
+        chunkTokens: numberType().int().min(5_000).max(200_000).default(60_000),
     })
         .default({}),
     files: objectType({
@@ -102546,6 +102738,8 @@ const DEFAULT_CONFIG = {
         minSeverity: 'suggestion',
         maxAnnotations: 30,
         failOn: 'critical',
+        contextTokens: 200_000,
+        chunkTokens: 60_000,
     },
     files: {
         include: ['**/*'],
@@ -102757,3 +102951,4 @@ async function run() {
     }
 }
 run();
+

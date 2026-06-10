@@ -23,6 +23,8 @@ export const DEFAULT_CONFIG: ReviewConfig = {
     minSeverity: 'suggestion',
     maxAnnotations: 30,
     failOn: 'critical',
+    contextTokens: 200_000,
+    chunkTokens: 60_000,
   },
   files: {
     include: ['**/*'],

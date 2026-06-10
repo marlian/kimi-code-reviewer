@@ -44,11 +44,24 @@ export interface ChatMessage {
     role: 'system' | 'user' | 'assistant';
     content: string;
 }
-export interface PackResult {
-    messages: ChatMessage[];
-    totalTokens: number;
-    includedFiles: string[];
-    truncatedFiles: string[];
+export interface FileBatch {
+    files: ChangedFile[];
+    /** Estimated tokens of the per-file patches in this batch (incl. framing). */
+    diffTokens: number;
+    /** Files in this batch whose full contents are included in the call. */
+    contentFiles: string[];
+}
+export interface PackPlan {
     strategy: 'full' | 'mixed' | 'chunked';
+    /** Files whose full contents are sent for context. */
+    includedFiles: string[];
+    /** Files whose contents are omitted to respect the budget. */
+    truncatedFiles: string[];
+    /** Changed files with no patch (binary / too large) — not reviewable inline. */
+    unreviewableFiles: string[];
+    /** Non-empty only for the chunked strategy: one API call per batch. */
+    batches: FileBatch[];
+    diffTokens: number;
+    contextTokens: number;
 }
 //# sourceMappingURL=review.d.ts.map

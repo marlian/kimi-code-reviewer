@@ -203,6 +203,14 @@ review:
   # When to fail the check: critical | warning | never
   failOn: critical
 
+  # Per-call input budget in tokens (10000-240000).
+  # Leaves headroom below Kimi's 256K window for thinking mode and output.
+  contextTokens: 200000
+
+  # Target diff tokens per batch when a large PR is reviewed in chunks
+  # across multiple API calls (5000-200000).
+  chunkTokens: 60000
+
 # File filters (minimatch glob patterns)
 files:
   include:
@@ -242,8 +250,24 @@ If no config file is found, sensible defaults are used.
 ## How It Works
 
 ```
-PR Event → Extract Context → Pack (256K) → Kimi API → Parse → Annotations
+PR Event → Extract Context → Plan Packing → Kimi API (1..N calls) → Merge → Annotations
 ```
+
+### Context Strategies
+
+The packer plans one of three strategies based on the configured budget
+(`review.contextTokens`, default 200K tokens per call):
+
+| Strategy | When | Behavior |
+|----------|------|----------|
+| `full` | diff + all file contents fit | One call with everything |
+| `mixed` | diff fits, contents do not | One call: full diff + contents of the most-changed files until budget |
+| `chunked` | diff alone exceeds the budget | Map-reduce: changed files split into batches of ~`chunkTokens` diff tokens, one call per batch, results merged (annotations deduplicated, score = worst part) |
+
+All calls share an identical system prompt + repo config prefix, so Kimi's
+prefix caching keeps multi-call (chunked) reviews cheap. Files with no
+patch (binary or too large for the GitHub API) are listed in the summary
+as not reviewable inline.
 
 ### Review Pipeline (12 Steps)
 
