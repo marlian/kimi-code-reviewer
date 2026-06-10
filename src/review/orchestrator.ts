@@ -10,7 +10,7 @@ import { parseKimiResponse } from '../kimi/response-parser.js';
 import { extractPullRequestContext } from '../github/pulls.js';
 import { createCheckRun, completeCheckRun } from '../github/checks.js';
 import { createPRReview } from '../github/comments.js';
-import { filterFiles } from './file-filter.js';
+import { filterFiles, filterUnifiedDiff } from './file-filter.js';
 import { buildSummary } from './summary-builder.js';
 import { ReviewError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -83,6 +83,9 @@ export class ReviewOrchestrator {
           prContext.fileContents.delete(name);
         }
       }
+      // Same for the unified diff: the API diff covers every changed file,
+      // so excluded files' hunks must be stripped before packing/planning.
+      prContext.diff = filterUnifiedDiff(prContext.diff, allowedFiles);
 
       // Step 4: Plan context packing (budget-aware)
       const plan = planContext(prContext, this.config);
