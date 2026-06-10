@@ -2,9 +2,10 @@ import type { Octokit } from '@octokit/rest';
 import type { ReviewConfig } from '../config/schema.js';
 import type { ReviewResult } from '../types/review.js';
 import { KimiClient } from '../kimi/client.js';
-import { packContext } from '../kimi/context-packer.js';
-import { buildReviewMessages } from '../kimi/prompt-builder.js';
-import { buildCacheOptimizedMessages } from '../kimi/cache-strategy.js';
+import { planContext } from '../kimi/context-packer.js';
+import { buildReviewSystemPrompt } from '../kimi/prompt-builder.js';
+import { buildCacheOptimizedMessages, buildChunkedMessages } from '../kimi/cache-strategy.js';
+import { mergeReviewResults } from './merge.js';
 import { parseKimiResponse } from '../kimi/response-parser.js';
 import { extractPullRequestContext } from '../github/pulls.js';
 import { createCheckRun, completeCheckRun } from '../github/checks.js';
@@ -74,35 +75,94 @@ export class ReviewOrchestrator {
         return result;
       }
 
-      // Step 4: Pack context (256K optimization)
-      const packed = packContext(prContext, this.config);
+      // Step 3.5: Drop contents of files excluded by the filter so they
+      // never reach the model context.
+      const allowedFiles = new Set(filteredFiles.map((f) => f.filename));
+      for (const name of [...prContext.fileContents.keys()]) {
+        if (!allowedFiles.has(name)) {
+          prContext.fileContents.delete(name);
+        }
+      }
+
+      // Step 4: Plan context packing (budget-aware)
+      const plan = planContext(prContext, this.config);
       logger.info(
-        { strategy: packed.strategy, totalTokens: packed.totalTokens },
-        'Context packed',
+        {
+          strategy: plan.strategy,
+          diffTokens: plan.diffTokens,
+          includedFiles: plan.includedFiles.length,
+          truncatedFiles: plan.truncatedFiles.length,
+          batches: plan.batches.length,
+        },
+        'Context planned',
       );
 
-      // Step 5: Build messages (cache-optimized order)
-      const systemPrompt = buildReviewMessages(prContext, this.config)[0].content;
-      const messages = buildCacheOptimizedMessages(
-        systemPrompt,
-        prContext,
-        this.config,
-        prContext.fileContents,
-      );
+      const systemPrompt = buildReviewSystemPrompt(this.config);
+      let result: ReviewResult;
 
-      // Step 6: Call Kimi API
-      logger.info({ messageCount: messages.length }, 'Calling Kimi API');
-      const response = await this.kimi.chatCompletion({
-        messages,
-        responseFormat: { type: 'json_object' },
-      });
+      if (plan.strategy === 'chunked') {
+        // Step 5-7 (chunked): one call per batch, then merge (map-reduce).
+        const parts: ReviewResult[] = [];
+        for (const [index, batch] of plan.batches.entries()) {
+          const messages = buildChunkedMessages(
+            systemPrompt,
+            prContext,
+            this.config,
+            batch,
+            index,
+            plan.batches.length,
+            prContext.fileContents,
+          );
+          logger.info(
+            { batch: index + 1, batches: plan.batches.length, files: batch.files.length, diffTokens: batch.diffTokens },
+            'Calling Kimi API (chunked)',
+          );
+          const response = await this.kimi.chatCompletion({
+            messages,
+            responseFormat: { type: 'json_object' },
+          });
+          parts.push(
+            parseKimiResponse(response.choices[0].message.content, {
+              input: response.usage.prompt_tokens,
+              output: response.usage.completion_tokens,
+              cached: response.usage.cached_tokens ?? 0,
+            }),
+          );
+        }
+        result = mergeReviewResults(parts);
+      } else {
+        // Step 5 (single call): only the planned file contents enter context.
+        const includedContents = new Map<string, string>();
+        for (const name of plan.includedFiles) {
+          const content = prContext.fileContents.get(name);
+          if (content) includedContents.set(name, content);
+        }
+        const messages = buildCacheOptimizedMessages(
+          systemPrompt,
+          prContext,
+          this.config,
+          includedContents,
+        );
 
-      // Step 7: Parse response
-      const result = parseKimiResponse(response.choices[0].message.content, {
-        input: response.usage.prompt_tokens,
-        output: response.usage.completion_tokens,
-        cached: response.usage.cached_tokens ?? 0,
-      });
+        // Step 6: Call Kimi API
+        logger.info({ messageCount: messages.length }, 'Calling Kimi API');
+        const response = await this.kimi.chatCompletion({
+          messages,
+          responseFormat: { type: 'json_object' },
+        });
+
+        // Step 7: Parse response
+        result = parseKimiResponse(response.choices[0].message.content, {
+          input: response.usage.prompt_tokens,
+          output: response.usage.completion_tokens,
+          cached: response.usage.cached_tokens ?? 0,
+        });
+      }
+
+      // Step 7.5: Surface files that could not be reviewed inline.
+      if (plan.unreviewableFiles.length > 0) {
+        result.summary += `\n\n**Not reviewed inline** (no patch available — binary or too large): ${plan.unreviewableFiles.join(', ')}`;
+      }
 
       // Step 8: Filter by severity
       const minSeverityOrder = ['critical', 'warning', 'suggestion', 'nitpick'];

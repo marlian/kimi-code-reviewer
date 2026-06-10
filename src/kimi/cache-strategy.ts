@@ -1,4 +1,4 @@
-import type { ChatMessage, PullRequestContext } from '../types/review.js';
+import type { ChatMessage, PullRequestContext, FileBatch } from '../types/review.js';
 import type { ReviewConfig } from '../config/schema.js';
 
 /**
@@ -17,12 +17,12 @@ import type { ReviewConfig } from '../config/schema.js';
  * 4. PR description (occasionally edited)
  * 5. Diff content (changes every push — always last)
  */
-export function buildCacheOptimizedMessages(
-  systemPrompt: string,
-  ctx: PullRequestContext,
-  config: ReviewConfig,
-  fileContents: Map<string, string>,
-): ChatMessage[] {
+/**
+ * Layers 1+2: system prompt + repo config acknowledgment. Identical across
+ * every call for the same repo — including all batches of a chunked review —
+ * which maximizes Kimi prefix cache hits.
+ */
+function buildStablePrefix(systemPrompt: string, config: ReviewConfig): ChatMessage[] {
   const messages: ChatMessage[] = [];
 
   // Layer 1: System prompt (most stable)
@@ -34,6 +34,17 @@ export function buildCacheOptimizedMessages(
     messages.push({ role: 'user', content: `Repository review configuration:\n${configSummary}` });
     messages.push({ role: 'assistant', content: 'Understood. I will follow the repository configuration.' });
   }
+
+  return messages;
+}
+
+export function buildCacheOptimizedMessages(
+  systemPrompt: string,
+  ctx: PullRequestContext,
+  config: ReviewConfig,
+  fileContents: Map<string, string>,
+): ChatMessage[] {
+  const messages: ChatMessage[] = buildStablePrefix(systemPrompt, config);
 
   // Layer 3: Base file contents (stable across pushes to same PR)
   if (fileContents.size > 0) {
@@ -56,6 +67,60 @@ export function buildCacheOptimizedMessages(
     reviewRequest.push(`- ${file.filename} (+${file.additions}/-${file.deletions})`);
   }
   reviewRequest.push(`\n### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\``);
+  reviewRequest.push('\nPlease review and respond with JSON.');
+
+  messages.push({ role: 'user', content: reviewRequest.join('\n') });
+
+  return messages;
+}
+
+/**
+ * Build messages for one batch of a chunked review. Shares the stable prefix
+ * with every other batch (prefix cache), then includes only this batch's
+ * file contents and per-file patches.
+ */
+export function buildChunkedMessages(
+  systemPrompt: string,
+  ctx: PullRequestContext,
+  config: ReviewConfig,
+  batch: FileBatch,
+  batchIndex: number,
+  batchCount: number,
+  fileContents: Map<string, string>,
+): ChatMessage[] {
+  const messages: ChatMessage[] = buildStablePrefix(systemPrompt, config);
+
+  // Layer 3: contents of this batch's files (when budget allows)
+  if (batch.contentFiles.length > 0) {
+    const fileParts: string[] = ['Here are the relevant source files for context:'];
+    for (const path of batch.contentFiles) {
+      const content = fileContents.get(path);
+      if (!content) continue;
+      fileParts.push(`\n### ${path}\n\`\`\`\n${content}\n\`\`\``);
+    }
+    messages.push({ role: 'user', content: fileParts.join('\n') });
+    messages.push({ role: 'assistant', content: 'Files loaded. Send me the pull request diff to review.' });
+  }
+
+  // Layer 4+5: PR metadata + this batch's per-file diffs
+  const reviewRequest: string[] = [];
+  reviewRequest.push(`## Pull Request #${ctx.pullNumber}: ${ctx.title}`);
+  if (ctx.body) {
+    reviewRequest.push(`\n### Description\n${ctx.body}`);
+  }
+  reviewRequest.push(
+    `\nThis pull request is too large for a single review pass, so it is split into ${batchCount} parts. ` +
+    `This is part ${batchIndex + 1} of ${batchCount}. Other parts are reviewed separately — ` +
+    `only annotate the files listed below, and do not penalize the score for files you cannot see.`,
+  );
+  reviewRequest.push(`\n### Changed Files in this part (${batch.files.length} files)`);
+  for (const file of batch.files) {
+    reviewRequest.push(`- ${file.filename} (+${file.additions}/-${file.deletions})`);
+  }
+  reviewRequest.push('\n### Diff');
+  for (const file of batch.files) {
+    reviewRequest.push(`\n#### ${file.filename}\n\`\`\`diff\n${file.patch ?? ''}\n\`\`\``);
+  }
   reviewRequest.push('\nPlease review and respond with JSON.');
 
   messages.push({ role: 'user', content: reviewRequest.join('\n') });

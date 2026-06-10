@@ -1,141 +1,171 @@
-import type { PullRequestContext, ChangedFile, PackResult, ChatMessage } from '../types/review.js';
+import type { PullRequestContext, ChangedFile, PackPlan, FileBatch } from '../types/review.js';
 import type { ReviewConfig } from '../config/schema.js';
 import { estimateTokens } from '../utils/tokens.js';
 import { logger } from '../utils/logger.js';
 
-const MAX_CONTEXT_TOKENS = 256_000;
-const SYSTEM_PROMPT_RESERVE = 4_000;
-const OUTPUT_RESERVE = 16_384;
-const BUDGET = MAX_CONTEXT_TOKENS - SYSTEM_PROMPT_RESERVE - OUTPUT_RESERVE; // ~235K
+/**
+ * Fraction of the per-call budget that the diff + file contents may occupy.
+ * The remainder is headroom for system prompt drift, message framing, and
+ * tokenizer estimation error.
+ */
+const PACK_FILL_RATIO = 0.9;
 
-const FULL_MODE_THRESHOLD = 50_000;
-const MIXED_MODE_THRESHOLD = 150_000;
+/**
+ * In mixed mode the diff must leave room for at least some file contents,
+ * otherwise mixed mode degenerates into diff-only and chunking is better.
+ */
+const MIXED_DIFF_RATIO = 0.6;
 
-export function packContext(
-  ctx: PullRequestContext,
-  config: ReviewConfig,
-): PackResult {
-  const diffTokens = estimateTokens(ctx.diff);
-  logger.info({ diffTokens, filesCount: ctx.changedFiles.length }, 'Packing context');
+/**
+ * In chunked mode, cap how much of the per-call budget file contents may
+ * occupy on top of the batch diff.
+ */
+const CHUNK_CONTENT_RATIO = 0.6;
 
-  if (diffTokens < FULL_MODE_THRESHOLD) {
-    return packFull(ctx, config);
-  }
-  if (diffTokens < MIXED_MODE_THRESHOLD) {
-    return packMixed(ctx, config);
-  }
-  return packChunked(ctx, config);
+/** Per-file framing overhead (markdown headers, fences) in tokens. */
+const FILE_OVERHEAD_TOKENS = 24;
+
+interface FileCost {
+  file: ChangedFile;
+  patchTokens: number;
+  contentTokens: number;
 }
 
-/** Full mode: include all file contents + diff */
-function packFull(ctx: PullRequestContext, _config: ReviewConfig): PackResult {
-  const includedFiles: string[] = [];
-  const messages: ChatMessage[] = [];
-  let totalTokens = 0;
-
-  // Add file contents
-  for (const file of ctx.changedFiles) {
+function fileCosts(ctx: PullRequestContext): FileCost[] {
+  return ctx.changedFiles.map((file) => {
     const content = ctx.fileContents.get(file.filename);
-    if (content) {
-      const tokens = estimateTokens(content);
-      if (totalTokens + tokens < BUDGET * 0.6) {
-        includedFiles.push(file.filename);
-        totalTokens += tokens;
-      }
-    }
-  }
-
-  // Build the user message with file contents + diff
-  const parts: string[] = [];
-  parts.push(`## Pull Request: ${ctx.title}\n`);
-  if (ctx.body) parts.push(`### Description\n${ctx.body}\n`);
-
-  if (includedFiles.length > 0) {
-    parts.push('### File Contents (full context)\n');
-    for (const path of includedFiles) {
-      const content = ctx.fileContents.get(path)!;
-      parts.push(`#### ${path}\n\`\`\`\n${content}\n\`\`\`\n`);
-    }
-  }
-
-  parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
-
-  messages.push({ role: 'user', content: parts.join('\n') });
-  totalTokens += estimateTokens(ctx.diff);
-
-  return {
-    messages,
-    totalTokens,
-    includedFiles,
-    truncatedFiles: [],
-    strategy: 'full',
-  };
+    return {
+      file,
+      patchTokens: file.patch ? estimateTokens(file.patch) + FILE_OVERHEAD_TOKENS : 0,
+      contentTokens: content ? estimateTokens(content) + FILE_OVERHEAD_TOKENS : 0,
+    };
+  });
 }
 
-/** Mixed mode: critical files get full content, rest get diff only */
-function packMixed(ctx: PullRequestContext, _config: ReviewConfig): PackResult {
-  const includedFiles: string[] = [];
-  const truncatedFiles: string[] = [];
-  let totalTokens = 0;
+/**
+ * Plan how the PR context will be sent to Kimi.
+ *
+ * - full: whole diff + all file contents fit in one call
+ * - mixed: whole diff in one call, file contents included by priority until budget
+ * - chunked: diff is too large for one call — split changed files into batches,
+ *   one API call per batch (map), results merged afterwards (reduce)
+ */
+export function planContext(ctx: PullRequestContext, config: ReviewConfig): PackPlan {
+  const contextTokens = config.review.contextTokens;
+  const chunkTokens = Math.min(config.review.chunkTokens, contextTokens);
+  const packBudget = Math.floor(contextTokens * PACK_FILL_RATIO);
 
-  // Prioritize files by change size (more changes = more important for context)
-  const sorted = [...ctx.changedFiles].sort(
-    (a, b) => (b.additions + b.deletions) - (a.additions + a.deletions),
+  const diffTokens = estimateTokens(ctx.diff);
+  const costs = fileCosts(ctx);
+  const totalContentTokens = costs.reduce((sum, c) => sum + c.contentTokens, 0);
+
+  logger.info(
+    { diffTokens, totalContentTokens, filesCount: ctx.changedFiles.length, contextTokens, chunkTokens },
+    'Planning context',
   );
 
-  for (const file of sorted) {
-    const content = ctx.fileContents.get(file.filename);
-    if (content) {
-      const tokens = estimateTokens(content);
-      if (totalTokens + tokens < BUDGET * 0.4) {
-        includedFiles.push(file.filename);
-        totalTokens += tokens;
+  // Full mode: everything fits.
+  if (diffTokens + totalContentTokens <= packBudget) {
+    return {
+      strategy: 'full',
+      includedFiles: costs.filter((c) => c.contentTokens > 0).map((c) => c.file.filename),
+      truncatedFiles: [],
+      unreviewableFiles: [],
+      batches: [],
+      diffTokens,
+      contextTokens,
+    };
+  }
+
+  // Mixed mode: full diff still fits with room for prioritized contents.
+  if (diffTokens <= Math.floor(contextTokens * MIXED_DIFF_RATIO)) {
+    const includedFiles: string[] = [];
+    const truncatedFiles: string[] = [];
+    let used = diffTokens;
+
+    // Prioritize files by change size (more changes = more important for context)
+    const sorted = [...costs].sort(
+      (a, b) =>
+        (b.file.additions + b.file.deletions) - (a.file.additions + a.file.deletions),
+    );
+
+    for (const cost of sorted) {
+      if (cost.contentTokens === 0) continue;
+      if (used + cost.contentTokens <= packBudget) {
+        includedFiles.push(cost.file.filename);
+        used += cost.contentTokens;
       } else {
-        truncatedFiles.push(file.filename);
+        truncatedFiles.push(cost.file.filename);
+      }
+    }
+
+    return {
+      strategy: 'mixed',
+      includedFiles,
+      truncatedFiles,
+      unreviewableFiles: [],
+      batches: [],
+      diffTokens,
+      contextTokens,
+    };
+  }
+
+  // Chunked mode: split files into batches of per-file patches.
+  const batches: FileBatch[] = [];
+  const unreviewableFiles: string[] = [];
+  let current: FileBatch | null = null;
+
+  for (const cost of costs) {
+    if (!cost.file.patch) {
+      // Binary or too-large-for-API files have no patch; they cannot be
+      // reviewed inline and are reported in the summary instead.
+      unreviewableFiles.push(cost.file.filename);
+      continue;
+    }
+
+    if (current && current.diffTokens + cost.patchTokens > chunkTokens) {
+      batches.push(current);
+      current = null;
+    }
+    if (!current) {
+      current = { files: [], diffTokens: 0, contentFiles: [] };
+    }
+    current.files.push(cost.file);
+    current.diffTokens += cost.patchTokens;
+  }
+  if (current && current.files.length > 0) {
+    batches.push(current);
+  }
+
+  // Per batch, attach file contents while the call stays within budget.
+  const contentBudget = Math.floor(contextTokens * CHUNK_CONTENT_RATIO);
+  for (const batch of batches) {
+    let used = batch.diffTokens;
+    const sorted = [...batch.files].sort(
+      (a, b) => (b.additions + b.deletions) - (a.additions + a.deletions),
+    );
+    for (const file of sorted) {
+      const cost = costs.find((c) => c.file.filename === file.filename);
+      if (!cost || cost.contentTokens === 0) continue;
+      if (used + cost.contentTokens <= contentBudget) {
+        batch.contentFiles.push(file.filename);
+        used += cost.contentTokens;
       }
     }
   }
 
-  const parts: string[] = [];
-  parts.push(`## Pull Request: ${ctx.title}\n`);
-  if (ctx.body) parts.push(`### Description\n${ctx.body}\n`);
-
-  if (includedFiles.length > 0) {
-    parts.push('### Key File Contents\n');
-    for (const path of includedFiles) {
-      const content = ctx.fileContents.get(path)!;
-      parts.push(`#### ${path}\n\`\`\`\n${content}\n\`\`\`\n`);
-    }
-  }
-
-  parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
-  totalTokens += estimateTokens(ctx.diff);
+  const includedFiles = batches.flatMap((b) => b.contentFiles);
+  const truncatedFiles = costs
+    .filter((c) => c.contentTokens > 0 && !includedFiles.includes(c.file.filename))
+    .map((c) => c.file.filename);
 
   return {
-    messages: [{ role: 'user', content: parts.join('\n') }],
-    totalTokens,
+    strategy: 'chunked',
     includedFiles,
     truncatedFiles,
-    strategy: 'mixed',
-  };
-}
-
-/** Chunked mode: split by files into multiple reviews */
-function packChunked(ctx: PullRequestContext, _config: ReviewConfig): PackResult {
-  // For chunked mode, just send the diff without file contents
-  // The orchestrator will handle splitting into multiple API calls
-  const parts: string[] = [];
-  parts.push(`## Pull Request: ${ctx.title}\n`);
-  if (ctx.body) parts.push(`### Description\n${ctx.body}\n`);
-  parts.push(`### Diff\n\`\`\`diff\n${ctx.diff}\n\`\`\`\n`);
-
-  const totalTokens = estimateTokens(ctx.diff);
-
-  return {
-    messages: [{ role: 'user', content: parts.join('\n') }],
-    totalTokens,
-    includedFiles: [],
-    truncatedFiles: ctx.changedFiles.map((f) => f.filename),
-    strategy: 'chunked',
+    unreviewableFiles,
+    batches,
+    diffTokens,
+    contextTokens,
   };
 }

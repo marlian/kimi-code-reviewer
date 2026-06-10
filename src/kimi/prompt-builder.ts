@@ -78,16 +78,20 @@ function buildUserPrompt(ctx: PullRequestContext, fileContents: Map<string, stri
   return parts.join('\n');
 }
 
-export function buildReviewMessages(
-  ctx: PullRequestContext,
-  config: ReviewConfig,
-): ChatMessage[] {
+export function buildReviewSystemPrompt(config: ReviewConfig): string {
   const customRules = config.rules
     .map((r) => `- [${r.severity}] ${r.name}: ${r.description}`)
     .join('\n');
 
+  return buildSystemPrompt(config, customRules);
+}
+
+export function buildReviewMessages(
+  ctx: PullRequestContext,
+  config: ReviewConfig,
+): ChatMessage[] {
   return [
-    { role: 'system', content: buildSystemPrompt(config, customRules) },
+    { role: 'system', content: buildReviewSystemPrompt(config) },
     { role: 'user', content: buildUserPrompt(ctx, ctx.fileContents) },
   ];
 }
