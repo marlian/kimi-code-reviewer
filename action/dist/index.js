@@ -102382,7 +102382,19 @@ class ReviewOrchestrator {
             }, 'Context planned');
             const systemPrompt = buildReviewSystemPrompt(this.config);
             let result;
-            if (plan.strategy === 'chunked') {
+            if (plan.strategy === 'chunked' && plan.batches.length === 0) {
+                // Every changed file lacks a text patch (binary or oversized diffs):
+                // nothing is reviewable inline — return a clean result instead of
+                // calling the API with empty batches.
+                result = {
+                    summary: 'No reviewable diff content: none of the changed files has a text patch (binary or oversized file diffs).',
+                    score: 100,
+                    annotations: [],
+                    stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
+                    tokensUsed: { input: 0, output: 0, cached: 0 },
+                };
+            }
+            else if (plan.strategy === 'chunked') {
                 // Step 5-7 (chunked): one call per batch, then merge (map-reduce).
                 const parts = [];
                 for (const [index, batch] of plan.batches.entries()) {

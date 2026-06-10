@@ -146,6 +146,20 @@ describe('planContext', () => {
     expect(batched).not.toContain('binary.png');
   });
 
+  it('returns zero batches when no changed file has a patch', () => {
+    const ctx = makeCtx(
+      [
+        { name: 'huge-generated.js' }, // no patch (oversized diff)
+        { name: 'image.png' }, // no patch (binary)
+      ],
+      40_000, // unified diff is still huge -> chunked
+    );
+    const plan = planContext(ctx, config);
+    expect(plan.strategy).toBe('chunked');
+    expect(plan.batches).toEqual([]);
+    expect(plan.unreviewableFiles).toEqual(['huge-generated.js', 'image.png']);
+  });
+
   it('attaches batch file contents only while the content budget allows', () => {
     // contentBudget = 6000 tokens. Batch diff ~1024; one content of ~4024 fits,
     // a second of ~4024 would exceed 6000.
