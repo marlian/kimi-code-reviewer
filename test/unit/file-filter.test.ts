@@ -54,3 +54,64 @@ describe('filterFiles', () => {
     expect(filtered).toHaveLength(1);
   });
 });
+
+import { filterUnifiedDiff } from '../../src/review/file-filter.js';
+
+function diffSection(path: string, body = '+added line'): string {
+  return [
+    `diff --git a/${path} b/${path}`,
+    `index 0000000..1111111 100644`,
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    '@@ -1,1 +1,1 @@',
+    body,
+  ].join('\n');
+}
+
+describe('filterUnifiedDiff', () => {
+  it('keeps only sections for allowed files', () => {
+    const diff = [diffSection('src/a.ts'), diffSection('dist/bundle.js'), diffSection('src/b.ts')].join('\n');
+    const out = filterUnifiedDiff(diff, new Set(['src/a.ts', 'src/b.ts']));
+    expect(out).toContain('a/src/a.ts');
+    expect(out).toContain('a/src/b.ts');
+    expect(out).not.toContain('dist/bundle.js');
+  });
+
+  it('keeps renamed files when either side is allowed', () => {
+    const rename = [
+      'diff --git a/src/old-name.ts b/src/new-name.ts',
+      'similarity index 90%',
+      'rename from src/old-name.ts',
+      'rename to src/new-name.ts',
+    ].join('\n');
+    const out = filterUnifiedDiff(rename, new Set(['src/new-name.ts']));
+    expect(out).toContain('rename to src/new-name.ts');
+  });
+
+  it('drops everything when nothing is allowed', () => {
+    const diff = diffSection('generated/big.js');
+    expect(filterUnifiedDiff(diff, new Set())).toBe('');
+  });
+
+  it('handles quoted paths with special characters', () => {
+    const quoted = [
+      'diff --git "a/src/sp ace.ts" "b/src/sp ace.ts"',
+      '--- "a/src/sp ace.ts"',
+      '+++ "b/src/sp ace.ts"',
+      '@@ -1,1 +1,1 @@',
+      '+x',
+    ].join('\n');
+    const out = filterUnifiedDiff(quoted, new Set(['src/sp ace.ts']));
+    expect(out).toContain('sp ace.ts');
+  });
+
+  it('fails open on unparseable headers', () => {
+    const weird = ['diff --git weird header line', '+content'].join('\n');
+    const out = filterUnifiedDiff(weird, new Set());
+    expect(out).toContain('+content');
+  });
+
+  it('returns empty diff unchanged', () => {
+    expect(filterUnifiedDiff('', new Set(['a.ts']))).toBe('');
+  });
+});

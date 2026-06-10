@@ -102234,6 +102234,46 @@ function filterFiles(files, config) {
     }
     return filtered;
 }
+// Matches `diff --git a/<path> b/<path>` headers, including quoted paths
+// (used by git when a path contains special characters).
+const DIFF_GIT_HEADER = /^diff --git (?:"a\/(.+?)"|a\/(.+?)) (?:"b\/(.+)"|b\/(.+))$/;
+/**
+ * Restrict a unified diff to the given set of file paths.
+ *
+ * The PR diff fetched from the GitHub API covers every changed file,
+ * including files excluded by the repo filter config — without this pass,
+ * excluded hunks (generated output, vendored code, scratch dirs) still
+ * reach the model in the full/mixed strategies.
+ *
+ * A section is kept when either side of its `diff --git` header is in the
+ * allowed set (covers renames). Headers that fail to parse are kept
+ * (fail open: reviewing too much is safer than silently dropping hunks).
+ */
+function filterUnifiedDiff(diff, allowed) {
+    if (!diff)
+        return diff;
+    const lines = diff.split('\n');
+    const out = [];
+    let keep = true;
+    for (const line of lines) {
+        if (line.startsWith('diff --git ')) {
+            const match = line.match(DIFF_GIT_HEADER);
+            if (match) {
+                const aPath = match[1] ?? match[2];
+                const bPath = match[3] ?? match[4];
+                keep =
+                    (aPath !== undefined && allowed.has(aPath)) ||
+                        (bPath !== undefined && allowed.has(bPath));
+            }
+            else {
+                keep = true;
+            }
+        }
+        if (keep)
+            out.push(line);
+    }
+    return out.join('\n');
+}
 
 ;// CONCATENATED MODULE: ./src/review/summary-builder.ts
 
@@ -102371,6 +102411,9 @@ class ReviewOrchestrator {
                     prContext.fileContents.delete(name);
                 }
             }
+            // Same for the unified diff: the API diff covers every changed file,
+            // so excluded files' hunks must be stripped before packing/planning.
+            prContext.diff = filterUnifiedDiff(prContext.diff, allowedFiles);
             // Step 4: Plan context packing (budget-aware)
             const plan = planContext(prContext, this.config);
             logger.info({
