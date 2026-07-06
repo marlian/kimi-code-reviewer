@@ -30,6 +30,10 @@ inputs:
     description: 'Thinking mode: default, enabled, or disabled. Set enabled for Kimi Code k2p6 deep reviews.'
     required: false
     default: 'default'
+  reasoning_effort:
+    description: 'Reasoning effort for thinking mode: high or max. Maps to output_config.effort on Anthropic protocol.'
+    required: false
+    default: ''
   timeout_ms:
     description: 'Kimi API request timeout in milliseconds. Increase for k2p6 thinking reviews on large PRs.'
     required: false

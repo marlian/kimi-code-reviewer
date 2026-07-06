@@ -8,6 +8,7 @@ export interface KimiClientConfig {
     timeout?: number;
     protocol?: 'openai' | 'anthropic';
     thinking?: KimiThinkingMode;
+    reasoningEffort?: string;
 }
 export type KimiThinkingMode = 'default' | 'enabled' | 'disabled';
 export interface ChatCompletionResponse {
@@ -37,6 +38,7 @@ export declare class KimiClient {
     private dispatcher;
     private protocol;
     private thinking;
+    private reasoningEffort?;
     constructor(config: KimiClientConfig);
     chatCompletion(params: {
         messages: ChatMessage[];
@@ -47,5 +49,6 @@ export declare class KimiClient {
     private openaiCompletion;
     private anthropicCompletion;
     private thinkingBody;
+    private reasoningBody;
 }
 //# sourceMappingURL=client.d.ts.map

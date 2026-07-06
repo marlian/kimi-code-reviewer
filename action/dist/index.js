@@ -102554,6 +102554,7 @@ class KimiClient {
     dispatcher;
     protocol;
     thinking;
+    reasoningEffort;
     constructor(config) {
         this.apiKey = config.apiKey;
         this.model = config.model ?? 'kimi-k2.5';
@@ -102567,6 +102568,7 @@ class KimiClient {
         });
         this.protocol = config.protocol ?? 'openai';
         this.thinking = config.thinking ?? 'default';
+        this.reasoningEffort = config.reasoningEffort;
     }
     async chatCompletion(params) {
         if (this.protocol === 'anthropic') {
@@ -102582,6 +102584,7 @@ class KimiClient {
             temperature: this.temperature,
             ...(params.responseFormat && { response_format: params.responseFormat }),
             ...this.thinkingBody(),
+            ...this.reasoningBody(),
         };
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeout);
@@ -102623,6 +102626,7 @@ class KimiClient {
             messages: otherMessages,
             stream: false,
             ...this.thinkingBody(),
+            ...this.reasoningBody(),
         };
         if (systemMessage) {
             body.system = systemMessage.content;
@@ -102680,6 +102684,15 @@ class KimiClient {
             return {};
         }
         return { thinking: { type: this.thinking } };
+    }
+    reasoningBody() {
+        if (!this.reasoningEffort) {
+            return {};
+        }
+        if (this.protocol === 'anthropic') {
+            return { output_config: { effort: this.reasoningEffort } };
+        }
+        return { reasoning_effort: this.reasoningEffort };
     }
 }
 
@@ -102916,6 +102929,7 @@ async function run() {
         const modelInput = core.getInput('model').trim();
         const protocolInput = core.getInput('protocol').trim();
         const thinking = parseThinkingMode(core.getInput('thinking').trim());
+        const reasoningEffort = core.getInput('reasoning_effort').trim() || undefined;
         const timeout = parsePositiveIntegerInput(core.getInput('timeout_ms').trim(), 'timeout_ms');
         const failOn = (core.getInput('fail_on') || 'critical');
         // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
@@ -102924,7 +102938,7 @@ async function run() {
         const isKimiCode = baseUrlInput.includes('api.kimi.com/coding');
         const protocol = (protocolInput || (isKimiCode ? 'anthropic' : 'openai'));
         const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
-        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, timeoutMs: ${timeout ?? 'default'}`);
+        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, reasoningEffort: ${reasoningEffort ?? 'default'}, timeoutMs: ${timeout ?? 'default'}`);
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
         // Only run on pull requests
@@ -102945,7 +102959,7 @@ async function run() {
         // Override failOn from action input
         config.review.failOn = failOn;
         // Create Kimi client
-        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, timeout });
+        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, reasoningEffort, timeout });
         // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         const result = await orchestrator.reviewPullRequest({

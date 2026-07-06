@@ -40,6 +40,7 @@ async function run(): Promise<void> {
     const modelInput = core.getInput('model').trim();
     const protocolInput = core.getInput('protocol').trim();
     const thinking = parseThinkingMode(core.getInput('thinking').trim());
+    const reasoningEffort = core.getInput('reasoning_effort').trim() || undefined;
     const timeout = parsePositiveIntegerInput(core.getInput('timeout_ms').trim(), 'timeout_ms');
     const failOn = (core.getInput('fail_on') || 'critical') as 'critical' | 'warning' | 'never';
 
@@ -51,7 +52,7 @@ async function run(): Promise<void> {
     const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
 
     core.info(
-      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, timeoutMs: ${timeout ?? 'default'}`,
+      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, reasoningEffort: ${reasoningEffort ?? 'default'}, timeoutMs: ${timeout ?? 'default'}`,
     );
 
     const octokit = github.getOctokit(githubToken);
@@ -80,7 +81,7 @@ async function run(): Promise<void> {
     config.review.failOn = failOn;
 
     // Create Kimi client
-    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, timeout });
+    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, reasoningEffort, timeout });
 
     // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);

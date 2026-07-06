@@ -12,6 +12,7 @@ export interface KimiClientConfig {
   timeout?: number;
   protocol?: 'openai' | 'anthropic';
   thinking?: KimiThinkingMode;
+  reasoningEffort?: string;
 }
 
 export type KimiThinkingMode = 'default' | 'enabled' | 'disabled';
@@ -41,6 +42,7 @@ export class KimiClient {
   private dispatcher: Agent;
   private protocol: 'openai' | 'anthropic';
   private thinking: KimiThinkingMode;
+  private reasoningEffort?: string;
 
   constructor(config: KimiClientConfig) {
     this.apiKey = config.apiKey;
@@ -55,6 +57,7 @@ export class KimiClient {
     });
     this.protocol = config.protocol ?? 'openai';
     this.thinking = config.thinking ?? 'default';
+    this.reasoningEffort = config.reasoningEffort;
   }
 
   async chatCompletion(params: {
@@ -78,6 +81,7 @@ export class KimiClient {
       temperature: this.temperature,
       ...(params.responseFormat && { response_format: params.responseFormat }),
       ...this.thinkingBody(),
+      ...this.reasoningBody(),
     };
 
     const controller = new AbortController();
@@ -136,6 +140,7 @@ export class KimiClient {
       messages: otherMessages,
       stream: false,
       ...this.thinkingBody(),
+      ...this.reasoningBody(),
     };
 
     if (systemMessage) {
@@ -212,5 +217,15 @@ export class KimiClient {
       return {};
     }
     return { thinking: { type: this.thinking } };
+  }
+
+  private reasoningBody(): Record<string, unknown> {
+    if (!this.reasoningEffort) {
+      return {};
+    }
+    if (this.protocol === 'anthropic') {
+      return { output_config: { effort: this.reasoningEffort } };
+    }
+    return { reasoning_effort: this.reasoningEffort };
   }
 }
