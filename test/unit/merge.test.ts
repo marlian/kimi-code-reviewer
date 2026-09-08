@@ -82,3 +82,25 @@ describe('mergeReviewResults', () => {
     expect(merged.summary).toContain('**Part 2/2:** second part');
   });
 });
+
+describe('mergeReviewResults with an incomplete part', () => {
+  it('marks the merged result incomplete, names the part, and keeps the other findings', () => {
+    const good = result({ annotations: [annotation({ path: 'src/a.ts' })] });
+    const bad = result({
+      score: 0,
+      annotations: [],
+      incomplete: { kind: 'parse', reason: 'malformed-json', detail: 'not JSON' },
+    });
+    const merged = mergeReviewResults([good, bad, good]);
+    expect(merged.incomplete).toEqual({ kind: 'parse', reason: 'malformed-json', detail: 'Part 2/3: not JSON' });
+    expect(merged.annotations).toHaveLength(1);
+    // The failed part has no score; the merged score is the worst reviewed one.
+    expect(merged.score).toBe(90);
+  });
+
+  it('leaves incomplete unset when every part parsed', () => {
+    const merged = mergeReviewResults([result(), result()]);
+    expect(merged.incomplete).toBeUndefined();
+    expect('incomplete' in merged).toBe(false);
+  });
+});

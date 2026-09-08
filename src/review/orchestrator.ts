@@ -12,7 +12,7 @@ import { createCheckRun, completeCheckRun } from '../github/checks.js';
 import { createPRReview } from '../github/comments.js';
 import { filterFiles, filterUnifiedDiff } from './file-filter.js';
 import { buildSummary } from './summary-builder.js';
-import { ReviewError } from '../utils/errors.js';
+import { KimiApiError, ReviewError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 
 interface ReviewParams {
@@ -190,9 +190,13 @@ export class ReviewOrchestrator {
         result.annotations = result.annotations.slice(0, this.config.review.maxAnnotations);
       }
 
-      // Step 10: Determine conclusion
-      const conclusion =
-        this.config.review.failOn === 'critical' && result.stats.critical > 0
+      // Step 10: Determine conclusion. An incomplete result carries no
+      // verdict: neutral, whatever fail_on says, and the reason is the first
+      // thing in the summary. Findings from the parts that did parse are
+      // still posted below.
+      const conclusion = result.incomplete
+        ? 'neutral'
+        : this.config.review.failOn === 'critical' && result.stats.critical > 0
           ? 'failure'
           : this.config.review.failOn === 'warning' &&
               (result.stats.critical > 0 || result.stats.warning > 0)
@@ -200,7 +204,10 @@ export class ReviewOrchestrator {
             : 'success';
 
       // Step 11: Update Check Run
-      const summaryMd = buildSummary(result);
+      const summaryMd = result.incomplete
+        ? `**Review incomplete (${result.incomplete.reason}):** ${result.incomplete.detail}` +
+          (result.annotations.length > 0 ? `\n\n${buildSummary(result)}` : '')
+        : buildSummary(result);
       await completeCheckRun(this.octokit, {
         owner,
         repo,
@@ -210,15 +217,19 @@ export class ReviewOrchestrator {
         annotations: result.annotations,
       });
 
-      // Step 12: Create PR Review
-      await createPRReview(this.octokit, {
-        owner,
-        repo,
-        pullNumber,
-        commitSha: headSha,
-        result,
-        failOn: this.config.review.failOn,
-      });
+      // Step 12: Create PR Review -- unless there is nothing to say: an
+      // incomplete result with no findings would post an empty review that
+      // reads like a pass.
+      if (!result.incomplete || result.annotations.length > 0) {
+        await createPRReview(this.octokit, {
+          owner,
+          repo,
+          pullNumber,
+          commitSha: headSha,
+          result,
+          failOn: this.config.review.failOn,
+        });
+      }
 
       logger.info(
         {
@@ -232,6 +243,35 @@ export class ReviewOrchestrator {
 
       return result;
     } catch (err) {
+      // A provider-side, transient refusal (quota exhausted, 5xx) is not a
+      // verdict on the PR and not a fault of this repository: the check ends
+      // neutral with the provider's message verbatim, and the caller gets an
+      // incomplete result to decide the job outcome from. Everything else --
+      // a bad key, a contract change, a bug here -- stays a failure.
+      if (err instanceof KimiApiError && err.isTransient) {
+        logger.warn(
+          { pullNumber, status: err.statusCode, kind: err.kind, apiMessage: err.apiMessage },
+          'Review skipped: provider unavailable',
+        );
+        const detail = `Kimi API ${err.statusCode}${err.apiMessage ? `: ${err.apiMessage}` : ''}`;
+        await completeCheckRun(this.octokit, {
+          owner,
+          repo,
+          checkRunId,
+          conclusion: 'neutral',
+          summary: `**Review skipped (${err.kind}):** ${detail}`,
+          annotations: [],
+        });
+        return {
+          summary: `Review skipped (${err.kind}): ${detail}`,
+          score: 0,
+          annotations: [],
+          stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
+          tokensUsed: { input: 0, output: 0, cached: 0 },
+          incomplete: { kind: 'api', reason: err.kind, detail },
+        };
+      }
+
       logger.error({ err, pullNumber }, 'Review failed');
 
       await completeCheckRun(this.octokit, {

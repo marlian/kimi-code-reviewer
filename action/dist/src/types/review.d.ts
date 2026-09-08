@@ -10,6 +10,19 @@ export interface ReviewAnnotation {
     body: string;
     suggestedFix?: string;
 }
+/**
+ * Why a result carries no verdict. Present only when the review did not
+ * complete: the provider refused or failed the call (`api`), or the model's
+ * output could not be parsed (`parse`). A result with this field set must
+ * never be read as "no issues found".
+ */
+export interface ReviewIncomplete {
+    kind: 'api' | 'parse';
+    /** `quota` | `server` for api; `malformed-json` for parse. */
+    reason: string;
+    /** Human-readable, safe to post: the provider's message verbatim (bounded), or the output shape. */
+    detail: string;
+}
 export interface ReviewResult {
     summary: string;
     score: number;
@@ -20,6 +33,7 @@ export interface ReviewResult {
         output: number;
         cached: number;
     };
+    incomplete?: ReviewIncomplete;
 }
 export interface ChangedFile {
     filename: string;

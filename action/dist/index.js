@@ -95469,8 +95469,12 @@ function buildConfigSummary(config) {
  * - annotations: concatenated, deduplicated by (path, startLine, title)
  * - stats: recomputed from the merged annotations
  * - tokensUsed: summed across batches
- * - score: minimum across batches (a PR is as healthy as its worst part)
+ * - score: minimum across the batches that were reviewed (a PR is as
+ *   healthy as its worst part; an incomplete part has no score)
  * - summary: per-part summaries joined under a chunked-review header
+ * - incomplete: set if any part is incomplete (first one wins, part number
+ *   added), so a batch the model failed on never reads as clean; the other
+ *   parts' findings are kept
  */
 function mergeReviewResults(parts) {
     if (parts.length === 0) {
@@ -95499,7 +95503,10 @@ function mergeReviewResults(parts) {
         output: acc.output + part.tokensUsed.output,
         cached: acc.cached + part.tokensUsed.cached,
     }), { input: 0, output: 0, cached: 0 });
-    const score = Math.min(...parts.map((part) => part.score));
+    // A part with no verdict has no score; the merged score is the worst of
+    // the parts that were actually reviewed.
+    const scored = parts.filter((part) => !part.incomplete).map((part) => part.score);
+    const score = scored.length > 0 ? Math.min(...scored) : 0;
     const summaryParts = [
         `Large PR reviewed in ${parts.length} parts (chunked mode).`,
         '',
@@ -95507,12 +95514,20 @@ function mergeReviewResults(parts) {
     parts.forEach((part, index) => {
         summaryParts.push(`**Part ${index + 1}/${parts.length}:** ${part.summary}`);
     });
+    const firstIncomplete = parts.findIndex((part) => part.incomplete);
+    const incomplete = firstIncomplete >= 0
+        ? {
+            ...parts[firstIncomplete].incomplete,
+            detail: `Part ${firstIncomplete + 1}/${parts.length}: ${parts[firstIncomplete].incomplete.detail}`,
+        }
+        : undefined;
     return {
         summary: summaryParts.join('\n'),
         score,
         annotations,
         stats,
         tokensUsed,
+        ...(incomplete ? { incomplete } : {}),
     };
 }
 
@@ -99828,12 +99843,21 @@ function parseKimiResponse(raw, tokenUsage) {
     const parsed = extractJson(raw);
     if (!parsed || typeof parsed !== 'object') {
         logger.error({ rawPreview: raw.slice(0, 500) }, 'Could not extract JSON from Kimi response');
+        // No verdict: the caller must not read this as a clean review. The
+        // detail is bounded and quotes only the shape of the output, never a
+        // full line of it -- the output is model text about PR content.
+        const head = raw.trimStart().slice(0, 40).replace(/\s+/g, ' ');
         return {
-            summary: 'Failed to parse Kimi response as JSON.',
-            score: 50,
+            summary: 'The model\'s output could not be parsed as a review.',
+            score: 0,
             annotations: [],
             stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
             tokensUsed: tokenUsage,
+            incomplete: {
+                kind: 'parse',
+                reason: 'malformed-json',
+                detail: `The model returned ${raw.length} characters (${tokenUsage.output} output tokens) that are not valid JSON; the output starts with "${head}".`,
+            },
         };
     }
     const result = reviewResponseSchema.safeParse(parsed);
@@ -99971,6 +99995,16 @@ async function createCheckRun(octokit, params) {
     logger.info({ checkRunId: data.id }, 'Check run created');
     return data.id;
 }
+function checkTitle(conclusion) {
+    switch (conclusion) {
+        case 'success':
+            return 'No critical issues found';
+        case 'neutral':
+            return 'No verdict: review skipped or incomplete';
+        default:
+            return 'Issues found';
+    }
+}
 async function completeCheckRun(octokit, params) {
     const { owner, repo, checkRunId, conclusion, summary, annotations } = params;
     // GitHub API limits annotations to 50 per request — batch them
@@ -99987,7 +100021,7 @@ async function completeCheckRun(octokit, params) {
         conclusion,
         completed_at: new Date().toISOString(),
         output: {
-            title: conclusion === 'success' ? 'No critical issues found' : 'Issues found',
+            title: checkTitle(conclusion),
             summary,
             annotations: (batches[0] ?? []).map(toCheckAnnotation),
         },
@@ -99999,7 +100033,7 @@ async function completeCheckRun(octokit, params) {
             repo,
             check_run_id: checkRunId,
             output: {
-                title: conclusion === 'success' ? 'No critical issues found' : 'Issues found',
+                title: checkTitle(conclusion),
                 summary,
                 annotations: batches[i].map(toCheckAnnotation),
             },
@@ -102323,14 +102357,70 @@ function buildSummary(result) {
 }
 
 ;// CONCATENATED MODULE: ./src/utils/errors.ts
+/** Longest provider message we carry into check summaries and job output. */
+const API_MESSAGE_MAX_CHARS = 600;
+/**
+ * Pull the provider's own message out of an error body. Both API shapes the
+ * client speaks put it at `error.message` (Anthropic: `{error:{type,message}}`,
+ * OpenAI: `{error:{message,type,code}}`). A body that is not JSON, or JSON
+ * without that field, is returned as-is, trimmed. Bounded either way.
+ */
+function extractApiMessage(body) {
+    let text;
+    if (typeof body === 'string') {
+        const trimmed = body.trim();
+        if (!trimmed)
+            return undefined;
+        try {
+            const parsed = JSON.parse(trimmed);
+            text = typeof parsed?.error?.message === 'string' ? parsed.error.message : trimmed;
+        }
+        catch {
+            text = trimmed;
+        }
+    }
+    else if (body && typeof body === 'object') {
+        const message = body.error?.message;
+        text = typeof message === 'string' ? message : JSON.stringify(body);
+    }
+    if (!text)
+        return undefined;
+    return text.length > API_MESSAGE_MAX_CHARS ? `${text.slice(0, API_MESSAGE_MAX_CHARS)}...` : text;
+}
+const QUOTA_MESSAGE = /usage limit|quota|rate limit|too many requests|insufficient_quota|exceeded/i;
+/**
+ * Classify a failed call by what the operator can do about it. `quota` and
+ * `server` are transient and outside the repository's control; `auth` and
+ * `other` are configuration or contract problems that must stay loud.
+ */
+function classifyApiError(status, apiMessage) {
+    if (status === 429)
+        return 'quota';
+    if (status === 403 && apiMessage && QUOTA_MESSAGE.test(apiMessage))
+        return 'quota';
+    if (status === 401 || status === 403)
+        return 'auth';
+    if (status >= 500)
+        return 'server';
+    return 'other';
+}
 class KimiApiError extends Error {
     statusCode;
     responseBody;
+    kind;
+    apiMessage;
     constructor(message, statusCode, responseBody) {
-        super(message);
+        const apiMessage = extractApiMessage(responseBody);
+        super(apiMessage ? `${message}: ${apiMessage}` : message);
         this.statusCode = statusCode;
         this.responseBody = responseBody;
         this.name = 'KimiApiError';
+        this.apiMessage = apiMessage;
+        this.kind = classifyApiError(statusCode, apiMessage);
+    }
+    /** Transient on the provider's side: the review is skipped, not failed. */
+    get isTransient() {
+        return this.kind === 'quota' || this.kind === 'server';
     }
 }
 class ConfigError extends Error {
@@ -102489,15 +102579,23 @@ class ReviewOrchestrator {
             if (result.annotations.length > this.config.review.maxAnnotations) {
                 result.annotations = result.annotations.slice(0, this.config.review.maxAnnotations);
             }
-            // Step 10: Determine conclusion
-            const conclusion = this.config.review.failOn === 'critical' && result.stats.critical > 0
-                ? 'failure'
-                : this.config.review.failOn === 'warning' &&
-                    (result.stats.critical > 0 || result.stats.warning > 0)
+            // Step 10: Determine conclusion. An incomplete result carries no
+            // verdict: neutral, whatever fail_on says, and the reason is the first
+            // thing in the summary. Findings from the parts that did parse are
+            // still posted below.
+            const conclusion = result.incomplete
+                ? 'neutral'
+                : this.config.review.failOn === 'critical' && result.stats.critical > 0
                     ? 'failure'
-                    : 'success';
+                    : this.config.review.failOn === 'warning' &&
+                        (result.stats.critical > 0 || result.stats.warning > 0)
+                        ? 'failure'
+                        : 'success';
             // Step 11: Update Check Run
-            const summaryMd = buildSummary(result);
+            const summaryMd = result.incomplete
+                ? `**Review incomplete (${result.incomplete.reason}):** ${result.incomplete.detail}` +
+                    (result.annotations.length > 0 ? `\n\n${buildSummary(result)}` : '')
+                : buildSummary(result);
             await completeCheckRun(this.octokit, {
                 owner,
                 repo,
@@ -102506,15 +102604,19 @@ class ReviewOrchestrator {
                 summary: summaryMd,
                 annotations: result.annotations,
             });
-            // Step 12: Create PR Review
-            await createPRReview(this.octokit, {
-                owner,
-                repo,
-                pullNumber,
-                commitSha: headSha,
-                result,
-                failOn: this.config.review.failOn,
-            });
+            // Step 12: Create PR Review -- unless there is nothing to say: an
+            // incomplete result with no findings would post an empty review that
+            // reads like a pass.
+            if (!result.incomplete || result.annotations.length > 0) {
+                await createPRReview(this.octokit, {
+                    owner,
+                    repo,
+                    pullNumber,
+                    commitSha: headSha,
+                    result,
+                    failOn: this.config.review.failOn,
+                });
+            }
             logger.info({
                 pullNumber,
                 score: result.score,
@@ -102524,6 +102626,31 @@ class ReviewOrchestrator {
             return result;
         }
         catch (err) {
+            // A provider-side, transient refusal (quota exhausted, 5xx) is not a
+            // verdict on the PR and not a fault of this repository: the check ends
+            // neutral with the provider's message verbatim, and the caller gets an
+            // incomplete result to decide the job outcome from. Everything else --
+            // a bad key, a contract change, a bug here -- stays a failure.
+            if (err instanceof KimiApiError && err.isTransient) {
+                logger.warn({ pullNumber, status: err.statusCode, kind: err.kind, apiMessage: err.apiMessage }, 'Review skipped: provider unavailable');
+                const detail = `Kimi API ${err.statusCode}${err.apiMessage ? `: ${err.apiMessage}` : ''}`;
+                await completeCheckRun(this.octokit, {
+                    owner,
+                    repo,
+                    checkRunId,
+                    conclusion: 'neutral',
+                    summary: `**Review skipped (${err.kind}):** ${detail}`,
+                    annotations: [],
+                });
+                return {
+                    summary: `Review skipped (${err.kind}): ${detail}`,
+                    score: 0,
+                    annotations: [],
+                    stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
+                    tokensUsed: { input: 0, output: 0, cached: 0 },
+                    incomplete: { kind: 'api', reason: err.kind, detail },
+                };
+            }
             logger.error({ err, pullNumber }, 'Review failed');
             await completeCheckRun(this.octokit, {
                 owner,
@@ -102969,15 +103096,22 @@ async function run() {
             headSha,
         });
         // Set outputs
+        core.setOutput('outcome', result.incomplete ? 'incomplete' : 'complete');
+        core.setOutput('incomplete_reason', result.incomplete?.reason ?? '');
         core.setOutput('review_summary', result.summary);
         core.setOutput('annotations_count', result.annotations.length.toString());
         core.setOutput('critical_count', result.stats.critical.toString());
         core.setOutput('tokens_used', (result.tokensUsed.input + result.tokensUsed.output).toString());
         core.setOutput('cost_estimate', calculateCost(result.tokensUsed).toString());
         // Summary in job output
+        core.summary.addHeading('Kimi Code Review', 2);
+        if (result.incomplete) {
+            core.summary.addRaw(`**Outcome:** ${result.incomplete.kind === 'api' ? 'skipped' : 'incomplete'} (${result.incomplete.reason})\n\n${result.incomplete.detail}\n\n`);
+        }
+        else {
+            core.summary.addRaw(`**Score:** ${result.score}/100\n\n`);
+        }
         core.summary
-            .addHeading('Kimi Code Review', 2)
-            .addRaw(`**Score:** ${result.score}/100\n\n`)
             .addRaw(result.summary)
             .addTable([
             [
@@ -102989,8 +103123,15 @@ async function run() {
             ['Suggestion', result.stats.suggestion.toString()],
         ]);
         await core.summary.write();
-        // Fail the action if needed
-        if (failOn === 'critical' && result.stats.critical > 0) {
+        // Fail the action if needed. No verdict is not a pass: unless the
+        // workflow opted out with fail_on: never, a PR that did not get its
+        // review does not get a green job either.
+        if (result.incomplete) {
+            if (failOn !== 'never') {
+                core.setFailed(`Review ${result.incomplete.kind === 'api' ? 'skipped' : 'incomplete'} (${result.incomplete.reason}): ${result.incomplete.detail}`);
+            }
+        }
+        else if (failOn === 'critical' && result.stats.critical > 0) {
             core.setFailed(`Found ${result.stats.critical} critical issue(s)`);
         }
         else if (failOn === 'warning' &&
