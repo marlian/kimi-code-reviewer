@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { PullRequestContext } from '../../src/types/review.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
-import { KimiApiError, ReviewError } from '../../src/utils/errors.js';
+import { KimiApiError, KimiTransportError, ReviewError } from '../../src/utils/errors.js';
 
 // The two external boundaries are faked -- GitHub (octokit) and the model
 // (KimiClient) -- and everything between them runs for real: file filter,
@@ -119,6 +119,51 @@ describe('ReviewOrchestrator outcomes', () => {
     expect(calls.update[0].output.title).toMatch(/No verdict/);
     expect(calls.update[0].output.summary).toBe(
       "**Review skipped (quota):** Kimi API 403: You've reached your weekly (7-day) usage limit.",
+    );
+    expect(calls.createReview).toHaveLength(0);
+  });
+
+  it('ends the check neutral when the call never completed, and says how many attempts it took', async () => {
+    const { octokit, calls } = fakeOctokit();
+    const err = new KimiTransportError('idle-timeout', 'Kimi API call abandoned: no bytes for 120000 ms');
+    err.attempts = 3;
+    const orchestrator = new ReviewOrchestrator(octokit as any, fakeKimi(err) as any, DEFAULT_CONFIG);
+
+    const result = await orchestrator.reviewPullRequest(params);
+
+    expect(result.incomplete).toEqual({
+      kind: 'api',
+      reason: 'idle-timeout',
+      detail: 'Kimi API call abandoned: no bytes for 120000 ms (after 3 attempts)',
+    });
+    expect(calls.update[0].conclusion).toBe('neutral');
+    expect(calls.update[0].output.summary).toBe(
+      '**Review skipped (idle-timeout):** Kimi API call abandoned: no bytes for 120000 ms (after 3 attempts)',
+    );
+  });
+
+  it('reports the output cap, not the output shape, when the provider says the cap cut the review', async () => {
+    const { octokit, calls } = fakeOctokit();
+    const kimi = {
+      maxTokens: 16384,
+      chatCompletion: vi.fn(async () => ({
+        id: 'x',
+        choices: [{ index: 0, message: { role: 'assistant', content: '{"summary": "The change' }, finish_reason: 'length' }],
+        usage: { prompt_tokens: 10, completion_tokens: 16384, total_tokens: 16394, cached_tokens: 0 },
+      })),
+    };
+    const orchestrator = new ReviewOrchestrator(octokit as any, kimi as any, DEFAULT_CONFIG);
+
+    const result = await orchestrator.reviewPullRequest(params);
+
+    expect(result.incomplete).toEqual({
+      kind: 'parse',
+      reason: 'max-tokens',
+      detail: 'The model hit max_tokens (16384) after 16384 output tokens and the review JSON was cut off; raise max_tokens.',
+    });
+    expect(calls.update[0].conclusion).toBe('neutral');
+    expect(calls.update[0].output.summary).toBe(
+      '**Review incomplete (max-tokens):** The model hit max_tokens (16384) after 16384 output tokens and the review JSON was cut off; raise max_tokens.',
     );
     expect(calls.createReview).toHaveLength(0);
   });

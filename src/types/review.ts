@@ -29,7 +29,12 @@ export interface ReviewAnnotation {
  */
 export interface ReviewIncomplete {
   kind: 'api' | 'parse';
-  /** `quota` | `server` for api; `malformed-json` for parse. */
+  /**
+   * For api: `quota` | `server` (an HTTP refusal), or `network` |
+   * `idle-timeout` | `timeout` | `stream` (the call never completed). For
+   * parse: `malformed-json`, or `max-tokens` when the provider reported the
+   * output cap cut the review off.
+   */
   reason: string;
   /** Human-readable, safe to post: the provider's message verbatim (bounded), or the output shape. */
   detail: string;

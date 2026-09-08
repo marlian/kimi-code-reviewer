@@ -80,10 +80,30 @@ That's it. Every PR will now get an AI code review.
 | `base_url` | No | `https://api.moonshot.cn/v1` | API endpoint. Set to `https://api.kimi.com/coding/v1` to use Kimi Code |
 | `model` | No | `kimi-k2.5` (or `k2p6` when `base_url` points at Kimi Code) | Model ID. Auto-defaults based on `base_url` |
 | `thinking` | No | `default` | Thinking mode: `default`, `enabled`, or `disabled`. Set `enabled` for Kimi Code `k2p6` deep reviews. |
-| `timeout_ms` | No | `300000` | Kimi API request timeout in milliseconds. Increase for `k2p6` thinking reviews on large PRs. |
+| `reasoning_effort` | No | — | Reasoning effort for thinking mode (`high`, `max`). Maps to `output_config.effort` on the Anthropic protocol, `reasoning_effort` on OpenAI's. |
+| `timeout_ms` | No | `300000` | Ceiling on one API call, connection to last byte. With streaming on, long thinking-mode calls are bounded by `idle_timeout_ms`, not by this. |
+| `idle_timeout_ms` | No | `120000` | Longest silence tolerated on a streaming call. No bytes (text, thinking deltas, keep-alive pings) for this long abandons the call; it is retried. |
+| `retry_attempts` | No | `3` | Total attempts per API call. Only 5xx, dropped or stalled connections and broken streams are retried, with backoff. Quota and auth refusals never are. |
+| `max_tokens` | No | `16384` | Output cap sent with every call. When the provider reports it cut the review off, the outcome is `incomplete` with reason `max-tokens`. |
+| `stream` | No | `true` | Stream the response. `false` sends a plain request and waits for the whole body, which edge proxies drop after ~600s of silence on long thinking-mode calls. |
 | `language` | No | `en` | Review language: `en`, `zh-TW`, `zh-CN`, `ja`, `ko` |
 | `fail_on` | No | `critical` | Fail the check on: `critical`, `warning`, `never` |
 | `config_path` | No | `.kimi-review.yml` | Path to config file |
+
+### Outcomes
+
+The action distinguishes a review from the absence of one. Outputs `outcome` (`complete` | `incomplete`) and `incomplete_reason` say which; an incomplete run ends the check run **neutral** ("No verdict: review skipped or incomplete") with the reason in its summary, and fails the job unless `fail_on: never`.
+
+| `incomplete_reason` | What happened | What to do |
+|---|---|---|
+| `quota` | 429, or a 403 whose message names a usage limit (Kimi Code's weekly cap, for instance) | Wait for the window, or use another key |
+| `server` | 5xx after `retry_attempts` | Nothing; re-run later |
+| `network`, `idle-timeout`, `stream` | Connection failed or dropped, no bytes for `idle_timeout_ms`, or the event stream broke -- after `retry_attempts` | Nothing; re-run later. Raise `idle_timeout_ms` if the provider is known to go quiet during reasoning |
+| `timeout` | One call exceeded `timeout_ms` (not retried) | Raise `timeout_ms`, or lower `chunkTokens` in `.kimi-review.yml` |
+| `max-tokens` | The provider reported the output cap cut the review JSON off | Raise `max_tokens` |
+| `malformed-json` | The output was not a review, and the cap was not the reason | Look at the run log; usually a prompt or model problem |
+
+A chunked review whose parts partly failed still posts the findings from the parts that parsed, and reports the first failed part as the reason.
 
 ### Example: Use Kimi Code API (recommended for code review)
 
