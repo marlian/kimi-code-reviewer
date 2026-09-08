@@ -103,32 +103,56 @@ function extractJson(raw: string): unknown | null {
   return null;
 }
 
+export interface ParseOptions {
+  /** `finish_reason` of the call, OpenAI vocabulary: `length` means the output cap cut it. */
+  finishReason?: string;
+  /** The `max_tokens` the call was made with, named in the detail when it was hit. */
+  maxTokens?: number;
+}
+
 export function parseKimiResponse(
   raw: string,
   tokenUsage: { input: number; output: number; cached: number },
+  options: ParseOptions = {},
 ): ReviewResult {
-  logger.info({ rawLength: raw.length, rawPreview: raw.slice(0, 300) }, 'Parsing Kimi response');
+  logger.info({ rawLength: raw.length, rawPreview: raw.slice(0, 300), finishReason: options.finishReason }, 'Parsing Kimi response');
 
   const parsed = extractJson(raw);
+  const truncated = options.finishReason === 'length';
 
   if (!parsed || typeof parsed !== 'object') {
-    logger.error({ rawPreview: raw.slice(0, 500) }, 'Could not extract JSON from Kimi response');
+    logger.error({ rawPreview: raw.slice(0, 500), truncated }, 'Could not extract JSON from Kimi response');
     // No verdict: the caller must not read this as a clean review. The
     // detail is bounded and quotes only the shape of the output, never a
-    // full line of it -- the output is model text about PR content.
+    // full line of it -- the output is model text about PR content. When
+    // the provider says the cap cut the output, name the cap: that is the
+    // one the operator raises, and the shape of the tail is noise.
     const head = raw.trimStart().slice(0, 40).replace(/\s+/g, ' ');
+    const cap = options.maxTokens ?? 'the configured value';
     return {
       summary: 'The model\'s output could not be parsed as a review.',
       score: 0,
       annotations: [],
       stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
       tokensUsed: tokenUsage,
-      incomplete: {
-        kind: 'parse',
-        reason: 'malformed-json',
-        detail: `The model returned ${raw.length} characters (${tokenUsage.output} output tokens) that are not valid JSON; the output starts with "${head}".`,
-      },
+      incomplete: truncated
+        ? {
+            kind: 'parse',
+            reason: 'max-tokens',
+            detail: `The model hit max_tokens (${cap}) after ${tokenUsage.output} output tokens and the review JSON was cut off; raise max_tokens.`,
+          }
+        : {
+            kind: 'parse',
+            reason: 'malformed-json',
+            detail: `The model returned ${raw.length} characters (${tokenUsage.output} output tokens) that are not valid JSON; the output starts with "${head}".`,
+          },
     };
+  }
+
+  if (truncated) {
+    // The JSON closed before the cap: the review is whole, the model kept
+    // talking after it. Worth a line in the log, not an outcome.
+    logger.warn({ outputTokens: tokenUsage.output }, 'Output hit max_tokens after the review JSON closed');
   }
 
   const result = reviewResponseSchema.safeParse(parsed);

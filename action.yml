@@ -35,9 +35,25 @@ inputs:
     required: false
     default: ''
   timeout_ms:
-    description: 'Kimi API request timeout in milliseconds. Increase for k2p6 thinking reviews on large PRs.'
+    description: 'Ceiling on one API call in milliseconds, connection to last byte. With streaming on, long thinking-mode calls are bounded by idle_timeout_ms, not by this.'
     required: false
     default: '300000'
+  idle_timeout_ms:
+    description: 'Longest silence tolerated on a streaming call, in milliseconds: no bytes (text, thinking deltas or keep-alive pings) for this long abandons the call, and it is retried. Default 120000.'
+    required: false
+    default: ''
+  retry_attempts:
+    description: 'Total attempts per API call. Only 5xx, dropped or stalled connections and broken streams are retried, with backoff; quota and auth refusals never are. Default 3.'
+    required: false
+    default: ''
+  max_tokens:
+    description: 'Output cap (max_tokens) sent with every call. When the provider reports it cut the review off, the outcome is incomplete with reason max-tokens. Default 16384.'
+    required: false
+    default: ''
+  stream:
+    description: 'true (default) streams the response and keeps the connection alive through the reasoning phase; false sends a plain request and waits, which edge proxies drop after ~600s of silence.'
+    required: false
+    default: ''
   language:
     description: 'Review comment language (en, zh-TW, zh-CN, ja, ko)'
     required: false
@@ -53,9 +69,9 @@ inputs:
 
 outputs:
   outcome:
-    description: "'complete' when the model returned a review, 'incomplete' when the provider refused the call (quota, 5xx) or the output could not be parsed; an incomplete run ends the check run neutral and fails the job unless fail_on is never"
+    description: "'complete' when the model returned a review, 'incomplete' when the provider refused the call (quota, 5xx), the call never completed (network, idle-timeout, timeout, stream) or the output could not be parsed; an incomplete run ends the check run neutral and fails the job unless fail_on is never"
   incomplete_reason:
-    description: "Why the outcome is incomplete: 'quota', 'server' or 'malformed-json'; empty when complete"
+    description: "Why the outcome is incomplete: 'quota', 'server', 'network', 'idle-timeout', 'timeout', 'stream', 'malformed-json' or 'max-tokens'; empty when complete"
   review_summary:
     description: 'The review summary text'
   annotations_count:

@@ -12,7 +12,7 @@ import { createCheckRun, completeCheckRun } from '../github/checks.js';
 import { createPRReview } from '../github/comments.js';
 import { filterFiles, filterUnifiedDiff } from './file-filter.js';
 import { buildSummary } from './summary-builder.js';
-import { KimiApiError, ReviewError } from '../utils/errors.js';
+import { KimiApiError, ReviewError, KimiTransportError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 
 interface ReviewParams {
@@ -136,11 +136,15 @@ export class ReviewOrchestrator {
             responseFormat: { type: 'json_object' },
           });
           parts.push(
-            parseKimiResponse(response.choices[0].message.content, {
-              input: response.usage.prompt_tokens,
-              output: response.usage.completion_tokens,
-              cached: response.usage.cached_tokens ?? 0,
-            }),
+            parseKimiResponse(
+              response.choices[0].message.content,
+              {
+                input: response.usage.prompt_tokens,
+                output: response.usage.completion_tokens,
+                cached: response.usage.cached_tokens ?? 0,
+              },
+              { finishReason: response.choices[0].finish_reason, maxTokens: this.kimi.maxTokens },
+            ),
           );
         }
         result = mergeReviewResults(parts);
@@ -166,11 +170,15 @@ export class ReviewOrchestrator {
         });
 
         // Step 7: Parse response
-        result = parseKimiResponse(response.choices[0].message.content, {
-          input: response.usage.prompt_tokens,
-          output: response.usage.completion_tokens,
-          cached: response.usage.cached_tokens ?? 0,
-        });
+        result = parseKimiResponse(
+          response.choices[0].message.content,
+          {
+            input: response.usage.prompt_tokens,
+            output: response.usage.completion_tokens,
+            cached: response.usage.cached_tokens ?? 0,
+          },
+          { finishReason: response.choices[0].finish_reason, maxTokens: this.kimi.maxTokens },
+        );
       }
 
       // Step 7.5: Surface files that could not be reviewed inline.
@@ -243,17 +251,28 @@ export class ReviewOrchestrator {
 
       return result;
     } catch (err) {
-      // A provider-side, transient refusal (quota exhausted, 5xx) is not a
-      // verdict on the PR and not a fault of this repository: the check ends
-      // neutral with the provider's message verbatim, and the caller gets an
-      // incomplete result to decide the job outcome from. Everything else --
-      // a bad key, a contract change, a bug here -- stays a failure.
-      if (err instanceof KimiApiError && err.isTransient) {
+      // A provider-side, transient refusal (quota exhausted, 5xx) or a call
+      // that never completed (connection dropped, stream stalled, timeout)
+      // is not a verdict on the PR and not a fault of this repository: the
+      // check ends neutral with the provider's message verbatim, and the
+      // caller gets an incomplete result to decide the job outcome from.
+      // Everything else -- a bad key, a contract change, a bug here --
+      // stays a failure. Retries already happened inside the client.
+      if ((err instanceof KimiApiError && err.isTransient) || err instanceof KimiTransportError) {
         logger.warn(
-          { pullNumber, status: err.statusCode, kind: err.kind, apiMessage: err.apiMessage },
+          {
+            pullNumber,
+            kind: err.kind,
+            attempts: err.attempts,
+            ...(err instanceof KimiApiError ? { status: err.statusCode, apiMessage: err.apiMessage } : { message: err.message }),
+          },
           'Review skipped: provider unavailable',
         );
-        const detail = `Kimi API ${err.statusCode}${err.apiMessage ? `: ${err.apiMessage}` : ''}`;
+        const attempts = err.attempts > 1 ? ` (after ${err.attempts} attempts)` : '';
+        const detail =
+          err instanceof KimiApiError
+            ? `Kimi API ${err.statusCode}${err.apiMessage ? `: ${err.apiMessage}` : ''}${attempts}`
+            : `${err.message}${attempts}`;
         await completeCheckRun(this.octokit, {
           owner,
           repo,

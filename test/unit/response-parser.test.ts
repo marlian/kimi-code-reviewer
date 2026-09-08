@@ -155,6 +155,24 @@ That concludes my review.`;
     expect(result.tokensUsed).toEqual(usage);
   });
 
+  it('names the output cap when the provider says it cut the review off', () => {
+    const raw = '{"summary": "The change looks fine but", "score": 8';
+    const result = parseKimiResponse(raw, usage, { finishReason: 'length', maxTokens: 16384 });
+    expect(result.incomplete).toEqual({
+      kind: 'parse',
+      reason: 'max-tokens',
+      detail: `The model hit max_tokens (16384) after ${usage.output} output tokens and the review JSON was cut off; raise max_tokens.`,
+    });
+    expect(result.score).toBe(0);
+  });
+
+  it('keeps a review whose JSON closed before the cap, whatever the model said after it', () => {
+    const raw = '{"summary": "Fine", "score": 90, "annotations": []}\n\nLet me also add that';
+    const result = parseKimiResponse(raw, usage, { finishReason: 'length', maxTokens: 16384 });
+    expect(result.incomplete).toBeUndefined();
+    expect(result.score).toBe(90);
+  });
+
   it('bounds and flattens the output head in the incomplete detail', () => {
     const raw = '```json\n{"summary": "unterminated string ...';
     const result = parseKimiResponse(raw, usage);

@@ -99838,27 +99838,42 @@ function extractJson(raw) {
     }
     return null;
 }
-function parseKimiResponse(raw, tokenUsage) {
-    logger.info({ rawLength: raw.length, rawPreview: raw.slice(0, 300) }, 'Parsing Kimi response');
+function parseKimiResponse(raw, tokenUsage, options = {}) {
+    logger.info({ rawLength: raw.length, rawPreview: raw.slice(0, 300), finishReason: options.finishReason }, 'Parsing Kimi response');
     const parsed = extractJson(raw);
+    const truncated = options.finishReason === 'length';
     if (!parsed || typeof parsed !== 'object') {
-        logger.error({ rawPreview: raw.slice(0, 500) }, 'Could not extract JSON from Kimi response');
+        logger.error({ rawPreview: raw.slice(0, 500), truncated }, 'Could not extract JSON from Kimi response');
         // No verdict: the caller must not read this as a clean review. The
         // detail is bounded and quotes only the shape of the output, never a
-        // full line of it -- the output is model text about PR content.
+        // full line of it -- the output is model text about PR content. When
+        // the provider says the cap cut the output, name the cap: that is the
+        // one the operator raises, and the shape of the tail is noise.
         const head = raw.trimStart().slice(0, 40).replace(/\s+/g, ' ');
+        const cap = options.maxTokens ?? 'the configured value';
         return {
             summary: 'The model\'s output could not be parsed as a review.',
             score: 0,
             annotations: [],
             stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
             tokensUsed: tokenUsage,
-            incomplete: {
-                kind: 'parse',
-                reason: 'malformed-json',
-                detail: `The model returned ${raw.length} characters (${tokenUsage.output} output tokens) that are not valid JSON; the output starts with "${head}".`,
-            },
+            incomplete: truncated
+                ? {
+                    kind: 'parse',
+                    reason: 'max-tokens',
+                    detail: `The model hit max_tokens (${cap}) after ${tokenUsage.output} output tokens and the review JSON was cut off; raise max_tokens.`,
+                }
+                : {
+                    kind: 'parse',
+                    reason: 'malformed-json',
+                    detail: `The model returned ${raw.length} characters (${tokenUsage.output} output tokens) that are not valid JSON; the output starts with "${head}".`,
+                },
         };
+    }
+    if (truncated) {
+        // The JSON closed before the cap: the review is whole, the model kept
+        // talking after it. Worth a line in the log, not an outcome.
+        logger.warn({ outputTokens: tokenUsage.output }, 'Output hit max_tokens after the review JSON closed');
     }
     const result = reviewResponseSchema.safeParse(parsed);
     if (result.success) {
@@ -102409,6 +102424,8 @@ class KimiApiError extends Error {
     responseBody;
     kind;
     apiMessage;
+    /** Attempts made before this error was given up on; set by the client. */
+    attempts = 1;
     constructor(message, statusCode, responseBody) {
         const apiMessage = extractApiMessage(responseBody);
         super(apiMessage ? `${message}: ${apiMessage}` : message);
@@ -102422,6 +102439,44 @@ class KimiApiError extends Error {
     get isTransient() {
         return this.kind === 'quota' || this.kind === 'server';
     }
+}
+/**
+ * The call never produced a usable HTTP response: the connection failed or
+ * dropped (`network`), no bytes arrived for `idleTimeout` (`idle-timeout`),
+ * the whole call outran `timeout` (`timeout`), or the event stream carried a
+ * provider error or ended before the message did (`stream`). All of these
+ * are the provider's or the network's doing, so the review is skipped, not
+ * failed; all but the overall timeout are worth another attempt.
+ */
+class KimiTransportError extends Error {
+    kind;
+    /** Attempts made before this error was given up on; set by the client. */
+    attempts = 1;
+    constructor(kind, message, options) {
+        super(message, options);
+        this.kind = kind;
+        this.name = 'KimiTransportError';
+    }
+    get isTransient() {
+        return true;
+    }
+    get isRetryable() {
+        return this.kind !== 'timeout';
+    }
+}
+/**
+ * Whether another attempt could reasonably succeed: a 5xx, a dropped or
+ * stalled connection, a broken stream. Never a quota refusal (the window
+ * does not clear in seconds), never auth or other 4xx (retrying a wrong
+ * request is the same wrong request), never the overall timeout (the
+ * budget is spent).
+ */
+function isRetryableError(err) {
+    if (err instanceof KimiApiError)
+        return err.kind === 'server';
+    if (err instanceof KimiTransportError)
+        return err.isRetryable;
+    return false;
 }
 class ConfigError extends Error {
     constructor(message) {
@@ -102541,7 +102596,7 @@ class ReviewOrchestrator {
                         input: response.usage.prompt_tokens,
                         output: response.usage.completion_tokens,
                         cached: response.usage.cached_tokens ?? 0,
-                    }));
+                    }, { finishReason: response.choices[0].finish_reason, maxTokens: this.kimi.maxTokens }));
                 }
                 result = mergeReviewResults(parts);
             }
@@ -102565,7 +102620,7 @@ class ReviewOrchestrator {
                     input: response.usage.prompt_tokens,
                     output: response.usage.completion_tokens,
                     cached: response.usage.cached_tokens ?? 0,
-                });
+                }, { finishReason: response.choices[0].finish_reason, maxTokens: this.kimi.maxTokens });
             }
             // Step 7.5: Surface files that could not be reviewed inline.
             if (plan.unreviewableFiles.length > 0) {
@@ -102626,14 +102681,24 @@ class ReviewOrchestrator {
             return result;
         }
         catch (err) {
-            // A provider-side, transient refusal (quota exhausted, 5xx) is not a
-            // verdict on the PR and not a fault of this repository: the check ends
-            // neutral with the provider's message verbatim, and the caller gets an
-            // incomplete result to decide the job outcome from. Everything else --
-            // a bad key, a contract change, a bug here -- stays a failure.
-            if (err instanceof KimiApiError && err.isTransient) {
-                logger.warn({ pullNumber, status: err.statusCode, kind: err.kind, apiMessage: err.apiMessage }, 'Review skipped: provider unavailable');
-                const detail = `Kimi API ${err.statusCode}${err.apiMessage ? `: ${err.apiMessage}` : ''}`;
+            // A provider-side, transient refusal (quota exhausted, 5xx) or a call
+            // that never completed (connection dropped, stream stalled, timeout)
+            // is not a verdict on the PR and not a fault of this repository: the
+            // check ends neutral with the provider's message verbatim, and the
+            // caller gets an incomplete result to decide the job outcome from.
+            // Everything else -- a bad key, a contract change, a bug here --
+            // stays a failure. Retries already happened inside the client.
+            if ((err instanceof KimiApiError && err.isTransient) || err instanceof KimiTransportError) {
+                logger.warn({
+                    pullNumber,
+                    kind: err.kind,
+                    attempts: err.attempts,
+                    ...(err instanceof KimiApiError ? { status: err.statusCode, apiMessage: err.apiMessage } : { message: err.message }),
+                }, 'Review skipped: provider unavailable');
+                const attempts = err.attempts > 1 ? ` (after ${err.attempts} attempts)` : '';
+                const detail = err instanceof KimiApiError
+                    ? `Kimi API ${err.statusCode}${err.apiMessage ? `: ${err.apiMessage}` : ''}${attempts}`
+                    : `${err.message}${attempts}`;
                 await completeCheckRun(this.octokit, {
                     owner,
                     repo,
@@ -102667,17 +102732,231 @@ class ReviewOrchestrator {
 
 // EXTERNAL MODULE: ./node_modules/undici/index.js
 var undici = __nccwpck_require__(6752);
+;// CONCATENATED MODULE: ./src/kimi/sse.ts
+class SseParser {
+    buffer = '';
+    event = '';
+    data = [];
+    feed(chunk) {
+        this.buffer += chunk;
+        const events = [];
+        for (;;) {
+            const match = /\r\n|\n|\r/.exec(this.buffer);
+            if (!match)
+                break;
+            // A lone `\r` at the very end may be the first half of `\r\n`: wait.
+            if (match[0] === '\r' && match.index === this.buffer.length - 1)
+                break;
+            const line = this.buffer.slice(0, match.index);
+            this.buffer = this.buffer.slice(match.index + match[0].length);
+            const event = this.line(line);
+            if (event)
+                events.push(event);
+        }
+        return events;
+    }
+    /** Dispatch whatever is pending once the body has ended. */
+    flush() {
+        const events = [];
+        // What is left is at most one partial line; a trailing `\r` that was
+        // held back in case `\n` followed is a line ending after all.
+        const rest = this.buffer.endsWith('\r') ? this.buffer.slice(0, -1) : this.buffer;
+        this.buffer = '';
+        if (rest) {
+            const event = this.line(rest);
+            if (event)
+                events.push(event);
+        }
+        const last = this.dispatch();
+        if (last)
+            events.push(last);
+        return events;
+    }
+    line(line) {
+        if (line === '')
+            return this.dispatch();
+        if (line.startsWith(':'))
+            return undefined;
+        const colon = line.indexOf(':');
+        const field = colon === -1 ? line : line.slice(0, colon);
+        let value = colon === -1 ? '' : line.slice(colon + 1);
+        if (value.startsWith(' '))
+            value = value.slice(1);
+        if (field === 'event')
+            this.event = value;
+        else if (field === 'data')
+            this.data.push(value);
+        // `id` and `retry` carry nothing for a one-shot completion.
+        return undefined;
+    }
+    dispatch() {
+        if (this.data.length === 0) {
+            this.event = '';
+            return undefined;
+        }
+        const event = { event: this.event, data: this.data.join('\n') };
+        this.event = '';
+        this.data = [];
+        return event;
+    }
+}
+
 ;// CONCATENATED MODULE: ./src/kimi/client.ts
 
 
 
+
+const DEFAULT_MAX_TOKENS = 16384;
+const DEFAULT_TIMEOUT_MS = 300_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+const DEFAULT_RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 2_000;
+/** Anthropic's stop reasons in OpenAI's words, so one parser reads both. */
+function normalizeStopReason(reason) {
+    if (!reason)
+        return 'stop';
+    if (reason === 'end_turn' || reason === 'stop_sequence')
+        return 'stop';
+    if (reason === 'max_tokens')
+        return 'length';
+    return reason;
+}
+function parseJson(data) {
+    try {
+        const value = JSON.parse(data);
+        return value && typeof value === 'object' ? value : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+class AnthropicStreamAssembler {
+    text = '';
+    thinkingChars = 0;
+    inputTokens = 0;
+    cachedTokens = 0;
+    outputTokens = 0;
+    stopReason;
+    stopped = false;
+    push(event) {
+        const data = parseJson(event.data);
+        if (!data)
+            return;
+        const type = typeof data.type === 'string' ? data.type : event.event;
+        switch (type) {
+            case 'message_start': {
+                const usage = data.message?.usage;
+                this.inputTokens = usage?.input_tokens ?? 0;
+                this.cachedTokens = usage?.cache_read_input_tokens ?? 0;
+                break;
+            }
+            case 'content_block_delta': {
+                const delta = data.delta;
+                if (delta?.type === 'text_delta' && typeof delta.text === 'string')
+                    this.text += delta.text;
+                else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string')
+                    this.thinkingChars += delta.thinking.length;
+                break;
+            }
+            case 'message_delta': {
+                const delta = data.delta;
+                if (delta?.stop_reason)
+                    this.stopReason = delta.stop_reason;
+                const usage = data.usage;
+                if (typeof usage?.output_tokens === 'number')
+                    this.outputTokens = usage.output_tokens;
+                break;
+            }
+            case 'message_stop':
+                this.stopped = true;
+                break;
+            case 'error': {
+                const error = data.error;
+                throw new KimiTransportError('stream', `Kimi API stream error: ${error?.type ?? 'error'}${error?.message ? `: ${error.message}` : ''}`);
+            }
+            default:
+                break;
+        }
+    }
+    finish() {
+        if (!this.stopped && !this.stopReason) {
+            throw new KimiTransportError('stream', 'Kimi API stream ended before the message did');
+        }
+        return {
+            id: 'anthropic',
+            choices: [{ index: 0, message: { role: 'assistant', content: this.text }, finish_reason: normalizeStopReason(this.stopReason) }],
+            usage: {
+                prompt_tokens: this.inputTokens,
+                completion_tokens: this.outputTokens,
+                total_tokens: this.inputTokens + this.outputTokens,
+                cached_tokens: this.cachedTokens,
+            },
+        };
+    }
+}
+class OpenAIStreamAssembler {
+    id = 'openai';
+    text = '';
+    thinkingChars = 0;
+    usage;
+    finishReason;
+    done = false;
+    push(event) {
+        if (event.data.trim() === '[DONE]') {
+            this.done = true;
+            return;
+        }
+        const data = parseJson(event.data);
+        if (!data)
+            return;
+        if (data.error && typeof data.error === 'object') {
+            const error = data.error;
+            throw new KimiTransportError('stream', `Kimi API stream error: ${error.type ?? 'error'}${error.message ? `: ${error.message}` : ''}`);
+        }
+        if (typeof data.id === 'string')
+            this.id = data.id;
+        const choice = data.choices?.[0];
+        const delta = choice?.delta;
+        if (typeof delta?.content === 'string')
+            this.text += delta.content;
+        if (typeof delta?.reasoning_content === 'string')
+            this.thinkingChars += delta.reasoning_content.length;
+        if (typeof choice?.finish_reason === 'string')
+            this.finishReason = choice.finish_reason;
+        const usage = data.usage;
+        if (usage && typeof usage.prompt_tokens === 'number') {
+            this.usage = {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens ?? 0,
+                total_tokens: usage.prompt_tokens + (usage.completion_tokens ?? 0),
+                cached_tokens: usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0,
+            };
+        }
+    }
+    finish() {
+        if (!this.done && !this.finishReason) {
+            throw new KimiTransportError('stream', 'Kimi API stream ended before the message did');
+        }
+        if (!this.usage) {
+            logger.warn('Kimi API stream carried no usage; token counts are zero for this call');
+        }
+        return {
+            id: this.id,
+            choices: [{ index: 0, message: { role: 'assistant', content: this.text }, finish_reason: this.finishReason ?? 'stop' }],
+            usage: this.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cached_tokens: 0 },
+        };
+    }
+}
 class KimiClient {
     baseUrl;
     apiKey;
     model;
-    maxTokens;
+    maxTokensValue;
     temperature;
     timeout;
+    idleTimeout;
+    retryAttempts;
+    stream;
     dispatcher;
     protocol;
     thinking;
@@ -102686,9 +102965,14 @@ class KimiClient {
         this.apiKey = config.apiKey;
         this.model = config.model ?? 'kimi-k2.5';
         this.baseUrl = config.baseUrl ?? 'https://api.moonshot.cn/v1';
-        this.maxTokens = config.maxTokens ?? 16384;
+        this.maxTokensValue = config.maxTokens ?? DEFAULT_MAX_TOKENS;
         this.temperature = config.temperature ?? 1;
-        this.timeout = config.timeout ?? 300_000;
+        this.timeout = config.timeout ?? DEFAULT_TIMEOUT_MS;
+        this.idleTimeout = config.idleTimeout ?? DEFAULT_IDLE_TIMEOUT_MS;
+        this.retryAttempts = Math.max(1, config.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS);
+        this.stream = config.stream ?? true;
+        // The socket-level timeouts back the overall ceiling; silence on a
+        // streaming call is caught earlier by the idle timer below.
         this.dispatcher = new undici/* Agent */.g6({
             headersTimeout: this.timeout,
             bodyTimeout: this.timeout,
@@ -102697,114 +102981,174 @@ class KimiClient {
         this.thinking = config.thinking ?? 'default';
         this.reasoningEffort = config.reasoningEffort;
     }
-    async chatCompletion(params) {
-        if (this.protocol === 'anthropic') {
-            return this.anthropicCompletion(params);
-        }
-        return this.openaiCompletion(params);
+    /** The output cap sent with every call; the parser names it when the output is cut. */
+    get maxTokens() {
+        return this.maxTokensValue;
     }
-    async openaiCompletion(params) {
-        const body = {
-            model: this.model,
-            messages: params.messages,
-            max_tokens: this.maxTokens,
-            temperature: this.temperature,
-            ...(params.responseFormat && { response_format: params.responseFormat }),
-            ...this.thinkingBody(),
-            ...this.reasoningBody(),
-        };
+    async chatCompletion(params) {
+        for (let attempt = 1;; attempt++) {
+            try {
+                return await this.completeOnce(params, attempt);
+            }
+            catch (err) {
+                if (!isRetryableError(err) || attempt >= this.retryAttempts) {
+                    if (err instanceof KimiApiError || err instanceof KimiTransportError)
+                        err.attempts = attempt;
+                    throw err;
+                }
+                const delayMs = this.retryDelayMs(attempt);
+                logger.warn({ attempt, of: this.retryAttempts, delayMs, err: err instanceof Error ? err.message : String(err) }, 'Kimi API call failed; retrying');
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+            }
+        }
+    }
+    /** 2s, 6s, 18s... with up to 25% jitter, so parallel jobs do not retry in step. */
+    retryDelayMs(attempt) {
+        const base = RETRY_BASE_DELAY_MS * 3 ** (attempt - 1);
+        return Math.round(base * (1 + Math.random() * 0.25));
+    }
+    async completeOnce(params, attempt) {
+        const { url, headers, body } = this.protocol === 'anthropic' ? this.anthropicRequest(params) : this.openaiRequest(params);
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), this.timeout);
+        let abortReason;
+        const overall = setTimeout(() => {
+            abortReason = 'timeout';
+            controller.abort();
+        }, this.timeout);
+        let idle;
+        // Armed before the request goes out, so a server that never answers is
+        // idle too; re-armed on every chunk, so a slow but live stream is not.
+        const armIdle = () => {
+            clearTimeout(idle);
+            idle = setTimeout(() => {
+                abortReason = 'idle-timeout';
+                controller.abort();
+            }, this.idleTimeout);
+        };
+        armIdle();
         try {
-            const res = await fetch(`${this.baseUrl}/chat/completions`, {
+            const res = await fetch(url, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${this.apiKey}`,
-                },
+                headers: { 'Content-Type': 'application/json', ...headers },
                 body: JSON.stringify(body),
                 signal: controller.signal,
                 dispatcher: this.dispatcher,
             });
+            armIdle();
             if (!res.ok) {
                 const errorBody = await res.text().catch(() => '');
                 throw new KimiApiError(`Kimi API error: ${res.status} ${res.statusText}`, res.status, errorBody);
             }
-            const data = (await res.json());
+            let response;
+            let thinkingChars = 0;
+            if (this.stream && res.body) {
+                const assembler = this.protocol === 'anthropic' ? new AnthropicStreamAssembler() : new OpenAIStreamAssembler();
+                const parser = new SseParser();
+                const decoder = new TextDecoder();
+                const reader = res.body.getReader();
+                for (;;) {
+                    const { done, value } = await reader.read();
+                    if (done)
+                        break;
+                    armIdle();
+                    for (const event of parser.feed(decoder.decode(value, { stream: true })))
+                        assembler.push(event);
+                }
+                for (const event of parser.flush())
+                    assembler.push(event);
+                response = assembler.finish();
+                thinkingChars = assembler.thinkingChars;
+            }
+            else {
+                const data = (await res.json());
+                response = this.protocol === 'anthropic' ? this.fromAnthropicMessage(data) : data;
+            }
             logger.info({
                 model: this.model,
-                promptTokens: data.usage.prompt_tokens,
-                completionTokens: data.usage.completion_tokens,
-                cachedTokens: data.usage.cached_tokens ?? 0,
+                protocol: this.protocol,
+                attempt,
+                streamed: this.stream,
+                promptTokens: response.usage.prompt_tokens,
+                completionTokens: response.usage.completion_tokens,
+                cachedTokens: response.usage.cached_tokens ?? 0,
+                thinkingChars,
+                finishReason: response.choices[0]?.finish_reason,
             }, 'Kimi API call completed');
-            return data;
+            return response;
+        }
+        catch (err) {
+            if (err instanceof KimiApiError || err instanceof KimiTransportError)
+                throw err;
+            if (abortReason === 'idle-timeout') {
+                throw new KimiTransportError('idle-timeout', `Kimi API call abandoned: no bytes for ${this.idleTimeout} ms`, { cause: err });
+            }
+            if (abortReason === 'timeout') {
+                throw new KimiTransportError('timeout', `Kimi API call abandoned: exceeded ${this.timeout} ms`, { cause: err });
+            }
+            const cause = err instanceof Error ? (err.cause instanceof Error ? err.cause.message : err.message) : String(err);
+            throw new KimiTransportError('network', `Kimi API call failed: ${cause}`, { cause: err });
         }
         finally {
-            clearTimeout(timer);
+            clearTimeout(overall);
+            clearTimeout(idle);
         }
     }
-    async anthropicCompletion(params) {
-        // Anthropic protocol: /messages endpoint
+    openaiRequest(params) {
+        return {
+            url: `${this.baseUrl}/chat/completions`,
+            headers: { Authorization: `Bearer ${this.apiKey}` },
+            body: {
+                model: this.model,
+                messages: params.messages,
+                max_tokens: this.maxTokensValue,
+                temperature: this.temperature,
+                ...(params.responseFormat && { response_format: params.responseFormat }),
+                ...(this.stream && { stream: true, stream_options: { include_usage: true } }),
+                ...this.thinkingBody(),
+                ...this.reasoningBody(),
+            },
+        };
+    }
+    anthropicRequest(params) {
         const systemMessage = params.messages.find((m) => m.role === 'system');
         const otherMessages = params.messages.filter((m) => m.role !== 'system');
         const body = {
             model: this.model,
-            max_tokens: this.maxTokens,
+            max_tokens: this.maxTokensValue,
             messages: otherMessages,
-            stream: false,
+            stream: this.stream,
             ...this.thinkingBody(),
             ...this.reasoningBody(),
         };
-        if (systemMessage) {
+        if (systemMessage)
             body.system = systemMessage.content;
-        }
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), this.timeout);
-        try {
-            const res = await fetch(`${this.baseUrl}/messages`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': this.apiKey,
-                    'anthropic-version': '2023-06-01',
+        return {
+            url: `${this.baseUrl}/messages`,
+            headers: { 'x-api-key': this.apiKey, 'anthropic-version': '2023-06-01' },
+            body,
+        };
+    }
+    fromAnthropicMessage(data) {
+        const content = data.content ?? [];
+        const usage = data.usage ?? {};
+        const inputTokens = usage.input_tokens ?? 0;
+        const outputTokens = usage.output_tokens ?? 0;
+        return {
+            id: 'anthropic',
+            choices: [
+                {
+                    index: 0,
+                    message: { role: 'assistant', content: content.filter((c) => c.type === 'text').map((c) => c.text ?? '').join('') },
+                    finish_reason: normalizeStopReason(data.stop_reason),
                 },
-                body: JSON.stringify(body),
-                signal: controller.signal,
-                dispatcher: this.dispatcher,
-            });
-            if (!res.ok) {
-                const errorBody = await res.text().catch(() => '');
-                throw new KimiApiError(`Kimi API error: ${res.status} ${res.statusText}`, res.status, errorBody);
-            }
-            const data = (await res.json());
-            const text = data.content.map((c) => c.text).join('');
-            const response = {
-                id: 'anthropic',
-                choices: [
-                    {
-                        index: 0,
-                        message: { role: 'assistant', content: text },
-                        finish_reason: 'stop',
-                    },
-                ],
-                usage: {
-                    prompt_tokens: data.usage.input_tokens,
-                    completion_tokens: data.usage.output_tokens,
-                    total_tokens: data.usage.input_tokens + data.usage.output_tokens,
-                    cached_tokens: 0,
-                },
-            };
-            logger.info({
-                model: this.model,
-                promptTokens: response.usage.prompt_tokens,
-                completionTokens: response.usage.completion_tokens,
-                cachedTokens: 0,
-            }, 'Kimi API call completed (Anthropic protocol)');
-            return response;
-        }
-        finally {
-            clearTimeout(timer);
-        }
+            ],
+            usage: {
+                prompt_tokens: inputTokens,
+                completion_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+                cached_tokens: usage.cache_read_input_tokens ?? 0,
+            },
+        };
     }
     thinkingBody() {
         if (this.thinking === 'default') {
@@ -103033,6 +103377,16 @@ function parseThinkingMode(raw) {
     }
     throw new Error('thinking must be one of: default, enabled, disabled');
 }
+function parseBooleanInput(raw, name) {
+    const value = raw.trim().toLowerCase();
+    if (value === '')
+        return undefined;
+    if (value === 'true')
+        return true;
+    if (value === 'false')
+        return false;
+    throw new Error(`${name} must be true or false`);
+}
 function parsePositiveIntegerInput(raw, name) {
     const value = raw.trim();
     if (value === '') {
@@ -103058,6 +103412,10 @@ async function run() {
         const thinking = parseThinkingMode(core.getInput('thinking').trim());
         const reasoningEffort = core.getInput('reasoning_effort').trim() || undefined;
         const timeout = parsePositiveIntegerInput(core.getInput('timeout_ms').trim(), 'timeout_ms');
+        const idleTimeout = parsePositiveIntegerInput(core.getInput('idle_timeout_ms').trim(), 'idle_timeout_ms');
+        const retryAttempts = parsePositiveIntegerInput(core.getInput('retry_attempts').trim(), 'retry_attempts');
+        const maxTokens = parsePositiveIntegerInput(core.getInput('max_tokens').trim(), 'max_tokens');
+        const stream = parseBooleanInput(core.getInput('stream'), 'stream');
         const failOn = (core.getInput('fail_on') || 'critical');
         // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
         // and default model to k2p6; otherwise fall back to Moonshot OpenAI defaults.
@@ -103065,7 +103423,7 @@ async function run() {
         const isKimiCode = baseUrlInput.includes('api.kimi.com/coding');
         const protocol = (protocolInput || (isKimiCode ? 'anthropic' : 'openai'));
         const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
-        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, reasoningEffort: ${reasoningEffort ?? 'default'}, timeoutMs: ${timeout ?? 'default'}`);
+        core.info(`Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, reasoningEffort: ${reasoningEffort ?? 'default'}, timeoutMs: ${timeout ?? 'default'}, idleTimeoutMs: ${idleTimeout ?? 'default'}, retryAttempts: ${retryAttempts ?? 'default'}, maxTokens: ${maxTokens ?? 'default'}, stream: ${stream ?? 'default'}`);
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
         // Only run on pull requests
@@ -103086,7 +103444,19 @@ async function run() {
         // Override failOn from action input
         config.review.failOn = failOn;
         // Create Kimi client
-        const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, reasoningEffort, timeout });
+        const kimi = new KimiClient({
+            apiKey: kimiApiKey,
+            model,
+            baseUrl,
+            protocol,
+            thinking,
+            reasoningEffort,
+            timeout,
+            idleTimeout,
+            retryAttempts,
+            maxTokens,
+            stream,
+        });
         // Run review
         const orchestrator = new ReviewOrchestrator(restOctokit, kimi, config);
         const result = await orchestrator.reviewPullRequest({

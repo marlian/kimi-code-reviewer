@@ -19,10 +19,39 @@ export declare class KimiApiError extends Error {
     responseBody?: unknown | undefined;
     readonly kind: KimiApiErrorKind;
     readonly apiMessage?: string;
+    /** Attempts made before this error was given up on; set by the client. */
+    attempts: number;
     constructor(message: string, statusCode: number, responseBody?: unknown | undefined);
     /** Transient on the provider's side: the review is skipped, not failed. */
     get isTransient(): boolean;
 }
+export type KimiTransportErrorKind = 'network' | 'idle-timeout' | 'timeout' | 'stream';
+/**
+ * The call never produced a usable HTTP response: the connection failed or
+ * dropped (`network`), no bytes arrived for `idleTimeout` (`idle-timeout`),
+ * the whole call outran `timeout` (`timeout`), or the event stream carried a
+ * provider error or ended before the message did (`stream`). All of these
+ * are the provider's or the network's doing, so the review is skipped, not
+ * failed; all but the overall timeout are worth another attempt.
+ */
+export declare class KimiTransportError extends Error {
+    readonly kind: KimiTransportErrorKind;
+    /** Attempts made before this error was given up on; set by the client. */
+    attempts: number;
+    constructor(kind: KimiTransportErrorKind, message: string, options?: {
+        cause?: unknown;
+    });
+    get isTransient(): boolean;
+    get isRetryable(): boolean;
+}
+/**
+ * Whether another attempt could reasonably succeed: a 5xx, a dropped or
+ * stalled connection, a broken stream. Never a quota refusal (the window
+ * does not clear in seconds), never auth or other 4xx (retrying a wrong
+ * request is the same wrong request), never the overall timeout (the
+ * budget is spent).
+ */
+export declare function isRetryableError(err: unknown): boolean;
 export declare class ConfigError extends Error {
     constructor(message: string);
 }

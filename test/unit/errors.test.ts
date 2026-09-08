@@ -4,6 +4,8 @@ import {
   KimiApiError,
   classifyApiError,
   extractApiMessage,
+  KimiTransportError,
+  isRetryableError,
 } from '../../src/utils/errors.js';
 
 // The body Kimi returned on 2026-09-08 (legate-dev/legate #281): a 403 whose
@@ -83,5 +85,26 @@ describe('KimiApiError', () => {
   it('is not transient for auth and other', () => {
     expect(new KimiApiError('Kimi API error: 401 Unauthorized', 401, '{"error":{"message":"invalid key"}}').isTransient).toBe(false);
     expect(new KimiApiError('Kimi API error: 400 Bad Request', 400, '').isTransient).toBe(false);
+  });
+});
+
+describe('retry policy', () => {
+  it('retries only what another attempt could fix', () => {
+    expect(isRetryableError(new KimiApiError('Kimi API error: 503 Service Unavailable', 503, ''))).toBe(true);
+    expect(isRetryableError(new KimiApiError('Kimi API error: 429 Too Many Requests', 429, ''))).toBe(false);
+    expect(isRetryableError(new KimiApiError('Kimi API error: 401 Unauthorized', 401, ''))).toBe(false);
+    expect(isRetryableError(new KimiApiError('Kimi API error: 400 Bad Request', 400, ''))).toBe(false);
+    expect(isRetryableError(new Error('something else'))).toBe(false);
+  });
+
+  it('retries every transport failure except the overall timeout', () => {
+    for (const kind of ['network', 'idle-timeout', 'stream'] as const) {
+      const err = new KimiTransportError(kind, kind);
+      expect(err.isRetryable).toBe(true);
+      expect(err.isTransient).toBe(true);
+    }
+    const timeout = new KimiTransportError('timeout', 'timeout');
+    expect(timeout.isRetryable).toBe(false);
+    expect(timeout.isTransient).toBe(true);
   });
 });

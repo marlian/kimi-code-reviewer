@@ -16,6 +16,14 @@ function parseThinkingMode(raw: string): KimiThinkingMode {
   throw new Error('thinking must be one of: default, enabled, disabled');
 }
 
+function parseBooleanInput(raw: string, name: string): boolean | undefined {
+  const value = raw.trim().toLowerCase();
+  if (value === '') return undefined;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${name} must be true or false`);
+}
+
 function parsePositiveIntegerInput(raw: string, name: string): number | undefined {
   const value = raw.trim();
   if (value === '') {
@@ -42,6 +50,10 @@ async function run(): Promise<void> {
     const thinking = parseThinkingMode(core.getInput('thinking').trim());
     const reasoningEffort = core.getInput('reasoning_effort').trim() || undefined;
     const timeout = parsePositiveIntegerInput(core.getInput('timeout_ms').trim(), 'timeout_ms');
+    const idleTimeout = parsePositiveIntegerInput(core.getInput('idle_timeout_ms').trim(), 'idle_timeout_ms');
+    const retryAttempts = parsePositiveIntegerInput(core.getInput('retry_attempts').trim(), 'retry_attempts');
+    const maxTokens = parsePositiveIntegerInput(core.getInput('max_tokens').trim(), 'max_tokens');
+    const stream = parseBooleanInput(core.getInput('stream'), 'stream');
     const failOn = (core.getInput('fail_on') || 'critical') as 'critical' | 'warning' | 'never';
 
     // Resolve endpoint defaults: if base_url points at Kimi Code, switch to Anthropic protocol
@@ -52,7 +64,7 @@ async function run(): Promise<void> {
     const model = modelInput || (isKimiCode ? 'k2p6' : 'kimi-k2.5');
 
     core.info(
-      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, reasoningEffort: ${reasoningEffort ?? 'default'}, timeoutMs: ${timeout ?? 'default'}`,
+      `Using protocol: ${protocol}, model: ${model}, baseUrl: ${baseUrl ?? 'default'}, thinking: ${thinking}, reasoningEffort: ${reasoningEffort ?? 'default'}, timeoutMs: ${timeout ?? 'default'}, idleTimeoutMs: ${idleTimeout ?? 'default'}, retryAttempts: ${retryAttempts ?? 'default'}, maxTokens: ${maxTokens ?? 'default'}, stream: ${stream ?? 'default'}`,
     );
 
     const octokit = github.getOctokit(githubToken);
@@ -81,7 +93,19 @@ async function run(): Promise<void> {
     config.review.failOn = failOn;
 
     // Create Kimi client
-    const kimi = new KimiClient({ apiKey: kimiApiKey, model, baseUrl, protocol, thinking, reasoningEffort, timeout });
+    const kimi = new KimiClient({
+      apiKey: kimiApiKey,
+      model,
+      baseUrl,
+      protocol,
+      thinking,
+      reasoningEffort,
+      timeout,
+      idleTimeout,
+      retryAttempts,
+      maxTokens,
+      stream,
+    });
 
     // Run review
     const orchestrator = new ReviewOrchestrator(restOctokit as any, kimi, config);

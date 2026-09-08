@@ -46,6 +46,8 @@ export function classifyApiError(status: number, apiMessage?: string): KimiApiEr
 export class KimiApiError extends Error {
   public readonly kind: KimiApiErrorKind;
   public readonly apiMessage?: string;
+  /** Attempts made before this error was given up on; set by the client. */
+  public attempts = 1;
 
   constructor(
     message: string,
@@ -63,6 +65,51 @@ export class KimiApiError extends Error {
   get isTransient(): boolean {
     return this.kind === 'quota' || this.kind === 'server';
   }
+}
+
+export type KimiTransportErrorKind = 'network' | 'idle-timeout' | 'timeout' | 'stream';
+
+/**
+ * The call never produced a usable HTTP response: the connection failed or
+ * dropped (`network`), no bytes arrived for `idleTimeout` (`idle-timeout`),
+ * the whole call outran `timeout` (`timeout`), or the event stream carried a
+ * provider error or ended before the message did (`stream`). All of these
+ * are the provider's or the network's doing, so the review is skipped, not
+ * failed; all but the overall timeout are worth another attempt.
+ */
+export class KimiTransportError extends Error {
+  /** Attempts made before this error was given up on; set by the client. */
+  public attempts = 1;
+
+  constructor(
+    public readonly kind: KimiTransportErrorKind,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'KimiTransportError';
+  }
+
+  get isTransient(): boolean {
+    return true;
+  }
+
+  get isRetryable(): boolean {
+    return this.kind !== 'timeout';
+  }
+}
+
+/**
+ * Whether another attempt could reasonably succeed: a 5xx, a dropped or
+ * stalled connection, a broken stream. Never a quota refusal (the window
+ * does not clear in seconds), never auth or other 4xx (retrying a wrong
+ * request is the same wrong request), never the overall timeout (the
+ * budget is spent).
+ */
+export function isRetryableError(err: unknown): boolean {
+  if (err instanceof KimiApiError) return err.kind === 'server';
+  if (err instanceof KimiTransportError) return err.isRetryable;
+  return false;
 }
 
 export class ConfigError extends Error {
