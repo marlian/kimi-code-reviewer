@@ -113,12 +113,21 @@ export function parseKimiResponse(
 
   if (!parsed || typeof parsed !== 'object') {
     logger.error({ rawPreview: raw.slice(0, 500) }, 'Could not extract JSON from Kimi response');
+    // No verdict: the caller must not read this as a clean review. The
+    // detail is bounded and quotes only the shape of the output, never a
+    // full line of it -- the output is model text about PR content.
+    const head = raw.trimStart().slice(0, 40).replace(/\s+/g, ' ');
     return {
-      summary: 'Failed to parse Kimi response as JSON.',
-      score: 50,
+      summary: 'The model\'s output could not be parsed as a review.',
+      score: 0,
       annotations: [],
       stats: { critical: 0, warning: 0, suggestion: 0, nitpick: 0 },
       tokensUsed: tokenUsage,
+      incomplete: {
+        kind: 'parse',
+        reason: 'malformed-json',
+        detail: `The model returned ${raw.length} characters (${tokenUsage.output} output tokens) that are not valid JSON; the output starts with "${head}".`,
+      },
     };
   }
 

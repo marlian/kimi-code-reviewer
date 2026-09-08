@@ -143,8 +143,23 @@ That concludes my review.`;
   it('returns fallback for completely unparseable text', () => {
     const raw = 'I cannot provide a review for this PR.';
     const result = parseKimiResponse(raw, usage);
-    expect(result.score).toBe(50);
+    // No verdict, not a middling one: the caller must be able to tell a
+    // parse failure from a review that found nothing.
+    expect(result.incomplete).toEqual({
+      kind: 'parse',
+      reason: 'malformed-json',
+      detail: expect.stringMatching(/^The model returned 38 characters \(\d+ output tokens\) that are not valid JSON; the output starts with "I cannot provide a review for this PR\."\.$/),
+    });
+    expect(result.score).toBe(0);
     expect(result.annotations).toHaveLength(0);
     expect(result.tokensUsed).toEqual(usage);
+  });
+
+  it('bounds and flattens the output head in the incomplete detail', () => {
+    const raw = '```json\n{"summary": "unterminated string ...';
+    const result = parseKimiResponse(raw, usage);
+    expect(result.incomplete?.kind).toBe('parse');
+    expect(result.incomplete?.detail).toContain('starts with "```json {"summary": "unterminated string');
+    expect(result.incomplete?.detail).not.toContain('\n');
   });
 });

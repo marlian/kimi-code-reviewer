@@ -52,6 +52,10 @@ inputs:
     default: '.kimi-review.yml'
 
 outputs:
+  outcome:
+    description: "'complete' when the model returned a review, 'incomplete' when the provider refused the call (quota, 5xx) or the output could not be parsed; an incomplete run ends the check run neutral and fails the job unless fail_on is never"
+  incomplete_reason:
+    description: "Why the outcome is incomplete: 'quota', 'server' or 'malformed-json'; empty when complete"
   review_summary:
     description: 'The review summary text'
   annotations_count:

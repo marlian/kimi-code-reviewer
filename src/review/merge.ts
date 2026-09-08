@@ -6,8 +6,12 @@ import type { ReviewResult, ReviewAnnotation, Severity } from '../types/review.j
  * - annotations: concatenated, deduplicated by (path, startLine, title)
  * - stats: recomputed from the merged annotations
  * - tokensUsed: summed across batches
- * - score: minimum across batches (a PR is as healthy as its worst part)
+ * - score: minimum across the batches that were reviewed (a PR is as
+ *   healthy as its worst part; an incomplete part has no score)
  * - summary: per-part summaries joined under a chunked-review header
+ * - incomplete: set if any part is incomplete (first one wins, part number
+ *   added), so a batch the model failed on never reads as clean; the other
+ *   parts' findings are kept
  */
 export function mergeReviewResults(parts: ReviewResult[]): ReviewResult {
   if (parts.length === 0) {
@@ -42,7 +46,10 @@ export function mergeReviewResults(parts: ReviewResult[]): ReviewResult {
     { input: 0, output: 0, cached: 0 },
   );
 
-  const score = Math.min(...parts.map((part) => part.score));
+  // A part with no verdict has no score; the merged score is the worst of
+  // the parts that were actually reviewed.
+  const scored = parts.filter((part) => !part.incomplete).map((part) => part.score);
+  const score = scored.length > 0 ? Math.min(...scored) : 0;
 
   const summaryParts: string[] = [
     `Large PR reviewed in ${parts.length} parts (chunked mode).`,
@@ -52,11 +59,21 @@ export function mergeReviewResults(parts: ReviewResult[]): ReviewResult {
     summaryParts.push(`**Part ${index + 1}/${parts.length}:** ${part.summary}`);
   });
 
+  const firstIncomplete = parts.findIndex((part) => part.incomplete);
+  const incomplete =
+    firstIncomplete >= 0
+      ? {
+          ...parts[firstIncomplete].incomplete!,
+          detail: `Part ${firstIncomplete + 1}/${parts.length}: ${parts[firstIncomplete].incomplete!.detail}`,
+        }
+      : undefined;
+
   return {
     summary: summaryParts.join('\n'),
     score,
     annotations,
     stats,
     tokensUsed,
+    ...(incomplete ? { incomplete } : {}),
   };
 }

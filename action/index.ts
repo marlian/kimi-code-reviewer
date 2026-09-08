@@ -93,6 +93,8 @@ async function run(): Promise<void> {
     });
 
     // Set outputs
+    core.setOutput('outcome', result.incomplete ? 'incomplete' : 'complete');
+    core.setOutput('incomplete_reason', result.incomplete?.reason ?? '');
     core.setOutput('review_summary', result.summary);
     core.setOutput('annotations_count', result.annotations.length.toString());
     core.setOutput('critical_count', result.stats.critical.toString());
@@ -103,9 +105,15 @@ async function run(): Promise<void> {
     core.setOutput('cost_estimate', calculateCost(result.tokensUsed).toString());
 
     // Summary in job output
+    core.summary.addHeading('Kimi Code Review', 2);
+    if (result.incomplete) {
+      core.summary.addRaw(
+        `**Outcome:** ${result.incomplete.kind === 'api' ? 'skipped' : 'incomplete'} (${result.incomplete.reason})\n\n${result.incomplete.detail}\n\n`,
+      );
+    } else {
+      core.summary.addRaw(`**Score:** ${result.score}/100\n\n`);
+    }
     core.summary
-      .addHeading('Kimi Code Review', 2)
-      .addRaw(`**Score:** ${result.score}/100\n\n`)
       .addRaw(result.summary)
       .addTable([
         [
@@ -118,8 +126,14 @@ async function run(): Promise<void> {
       ]);
     await core.summary.write();
 
-    // Fail the action if needed
-    if (failOn === 'critical' && result.stats.critical > 0) {
+    // Fail the action if needed. No verdict is not a pass: unless the
+    // workflow opted out with fail_on: never, a PR that did not get its
+    // review does not get a green job either.
+    if (result.incomplete) {
+      if (failOn !== 'never') {
+        core.setFailed(`Review ${result.incomplete.kind === 'api' ? 'skipped' : 'incomplete'} (${result.incomplete.reason}): ${result.incomplete.detail}`);
+      }
+    } else if (failOn === 'critical' && result.stats.critical > 0) {
       core.setFailed(`Found ${result.stats.critical} critical issue(s)`);
     } else if (
       failOn === 'warning' &&
