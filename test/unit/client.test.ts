@@ -221,6 +221,10 @@ describe('KimiClient streaming (OpenAI protocol)', () => {
       reasoning_effort: 'high',
       messages,
     });
+    // Reasoning models on the OpenAI protocol take max_completion_tokens;
+    // max_tokens is ignored (DigitalOcean) or rejected (OpenAI o-series).
+    expect(requests[0].body).toMatchObject({ max_completion_tokens: expect.any(Number) });
+    expect(requests[0].body).not.toHaveProperty('max_tokens');
   });
 });
 
