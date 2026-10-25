@@ -365,7 +365,11 @@ export class KimiClient {
       body: {
         model: this.model,
         messages: params.messages,
-        max_tokens: this.maxTokensValue,
+        // max_completion_tokens, not max_tokens: on the OpenAI protocol the
+        // reasoning models (GLM, DeepSeek, Kimi on DigitalOcean; o-series on
+        // OpenAI) ignore or reject max_tokens, and the review ran unbounded
+        // (97k output tokens on one PR). Anthropic keeps max_tokens.
+        max_completion_tokens: this.maxTokensValue,
         temperature: this.temperature,
         ...(params.responseFormat && { response_format: params.responseFormat }),
         ...(this.stream && { stream: true, stream_options: { include_usage: true } }),
